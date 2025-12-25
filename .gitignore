@@ -1,0 +1,7 @@
+.env
+.venv/
+aiposts/
+__pycache__/
+*.pyc
+.pycache_sandbox/
+temp_plot*.png

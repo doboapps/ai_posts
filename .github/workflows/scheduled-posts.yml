@@ -1,0 +1,61 @@
+name: Scheduled macro drafts
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check time window
+        id: gate
+        env:
+          RUN_TZ: ${{ vars.RUN_TZ }}
+          RUN_START_HOUR: ${{ vars.RUN_START_HOUR }}
+          RUN_END_HOUR: ${{ vars.RUN_END_HOUR }}
+        run: |
+          tz="${RUN_TZ:-UTC}"
+          start="${RUN_START_HOUR:-8}"
+          end="${RUN_END_HOUR:-21}"
+          hour="$(TZ="$tz" date +%H)"
+          hour="$((10#$hour))"
+          echo "Now: hour=$hour tz=$tz window=${start}-${end}"
+          if [ "$hour" -ge "$start" ] && [ "$hour" -le "$end" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.gate.outputs.should_run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scheduled sender
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          RUN_TZ: ${{ vars.RUN_TZ }}
+          RUN_START_HOUR: ${{ vars.RUN_START_HOUR }}
+          RUN_END_HOUR: ${{ vars.RUN_END_HOUR }}
+          MAX_DRAFTS: ${{ vars.MAX_DRAFTS }}
+          SEND_EMPTY_MESSAGE: ${{ vars.SEND_EMPTY_MESSAGE }}
+        run: python scheduled_run.py
