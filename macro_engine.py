@@ -3,7 +3,7 @@ import random
 import re
 import textwrap
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
@@ -13,73 +13,88 @@ from openai import OpenAI
 
 load_dotenv()
 
-
 def get_hot_macro_news():
-    """Radar de alta precision: PIB, metales, bancos centrales y geopolitica."""
     api_key = os.getenv("TAVILY_API_KEY")
+    now = datetime.now()
 
-    # Busqueda de impacto directo con datos reales y foco macro
-    temas_clave = (
-        "PIB GDP growth crecimiento, "
-        "gold oro silver plata metales record, "
-        "Fed interest rates tipos, "
-        "Trump tariffs aranceles, "
-        "China datos macro, "
-        "UE Eurozona ECB BCE"
+    # Lógica de ventana: Si estamos a final de mes/trimestre, miramos al frente
+    # Si quedan menos de 10 días para el mes siguiente, pivotamos la búsqueda
+    if (now + timedelta(days=10)).month != now.month:
+        proximo_mes = (now + timedelta(days=10)).strftime("%B")
+        anio_objetivo = (now + timedelta(days=10)).year
+        contexto_temporal = f"expectations and early signals for {proximo_mes} {anio_objetivo}"
+    else:
+        contexto_temporal = f"current market drivers and volatility for {now.strftime('%B %Y')}"
+
+    # Buscamos por "catalizadores" y "sorpresas", no por etiquetas fijas
+    query = (
+        f"{contexto_temporal}, "
+        "institutional rebalancing and dark pool activity, "
+        "breaking financial news with immediate price impact, "
+        "unusual options flow and market sentiment shifts"
     )
-
-    query = f"financial news {datetime.now().strftime('%Y-%m-%d')} {temas_clave}"
 
     payload = {
         "api_key": api_key,
         "query": query,
         "search_depth": "advanced",
-        "max_results": 10,
+        "max_results": 12,
+        "time_range": "day",
+        "include_raw_content": True
     }
+
     try:
-        print("[*] Escaneando datos duros del mercado...")
-        r = requests.post("https://api.tavily.com/search", json=payload, timeout=15)
+        print(f"[*] Escaneando ventana de impacto: {contexto_temporal}...")
+        r = requests.post("https://api.tavily.com/search", json=payload, timeout=30)
         return r.json().get("results", [])
     except Exception as e:
         print(f"[!] Error: {e}")
         return []
 
-
 def select_diverse_news(news_results):
-    """Filtra noticias para evitar repeticiones y priorizar datos reales."""
     final_selection = []
     temas_vistos = set()
 
-    for item in news_results:
-        text = (item.get("title", "") + " " + item.get("content", "")).lower()
+    # Mezclamos un poco para no coger siempre lo mismo si hay muchos resultados
+    random.shuffle(news_results)
 
-        # Priorizamos que la noticia tenga numeros (datos)
+    for item in news_results:
+        title = item.get("title", "")
+        content = item.get("content", "")
+        text = (title + " " + content).lower()
+
+        # 1. Filtro de Datos: Priorizamos noticias con movimiento numérico
         has_numbers = any(char.isdigit() for char in text)
         if not has_numbers:
             continue
 
+        # 2. Nueva lógica de categorización más amplia
         if any(x in text for x in ["gold", "oro", "silver", "plata"]):
             tema = "metales"
         elif any(x in text for x in ["gdp", "pib", "growth", "crecimiento"]):
             tema = "crecimiento"
-        elif any(x in text for x in ["tariff", "arancel", "trade war"]):
-            tema = "comercio"
-        elif any(x in text for x in ["fed", "ecb", "bce", "rates", "tipos"]):
+        elif any(x in text for x in ["fed", "ecb", "bce", "rates", "tipos", "powell", "lagarde"]):
             tema = "bancos_centrales"
+        elif any(x in text for x in ["altman", "musk", "saylor", "burry", "buffett", "nvidia", "apple", "tesla", "openai"]):
+            # Capturamos a los "Market Movers" que mencionabas
+            tema = "market_movers"
+        elif any(x in text for x in ["ai", "ia", "tech", "tecnología", "breakthrough", "disrupción"]):
+            tema = "disrupcion_tech"
         else:
-            tema = "otros"
+            tema = "otros_impacto"
 
+        # 3. Solo añadimos si el tema no está repetido en este ciclo
         if tema not in temas_vistos:
             final_selection.append(item)
             temas_vistos.add(tema)
 
+        # Límite de 3 noticias por hora para no saturar
         if len(final_selection) >= 3:
             break
+
     return final_selection
 
-
 def generate_expert_post(client: OpenAI, news_content: str, source_name: str):
-    """Genera posts con análisis, probabilidades y preguntas punzantes."""
     suggested_handle = _guess_source_handle(source_name) or source_name
     prompt = f"""
 NOTICIA: {news_content}
@@ -91,32 +106,27 @@ TAREA: Devuelve una respuesta dividida en 2 partes usando EXACTAMENTE el separad
 PARTE 1 (IMAGEN):
 - Análisis macro corto + dato(s) numéricos + Probabilidad específica.
 - NO incluyas hashtags ni fuentes aquí.
-- IMPORTANTE: Termina esta parte con una PREGUNTA abierta y punzante que invite al debate.
 
 ###
 
-PARTE 2 (POST):
-- 1 titular de impacto que resuma la noticia (1 línea).
-- 1 línea con la fuente usando HANDLE_SUGERIDO (ej. "Fuente: @bloomberg").
-- 1 línea con máximo 2 hashtags.
+PARTE 2 (POST PARA X):
+- Una PREGUNTA que se entienda sola, incluyendo el contexto y la cifra clave (ej: "¿Es realista que el Bitcoin alcance los 150K tras este último movimiento de Saylor?").
+- 1 línea con la fuente: "Fuente: {suggested_handle}".
+- 1 línea con 1 o 2 hashtags (trending).
 
 REGLAS:
 1. IDIOMA: Español de España.
-2. ESTILO: Analista de Hedge Fund, directo y provocador.
-3. LONGITUD: Mantén el total de la respuesta breve para que quepa en la imagen.
+2. AUTONOMÍA: El post debe entenderse sin mirar la imagen. Prohibido usar "esta noticia" o "¿llegará a ese precio?". Nombra el precio y el activo.
+3. ESTILO: Analista senior, directo y provocador.
 """
     try:
         resp = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {
-                    "role": "system",
-                    "content": "Analista financiero senior. Tu objetivo es generar debate y engagement en X mediante preguntas desafiantes.",
-                },
+                {"role": "system", "content": "Generas contenido financiero de alto impacto para X. Tus posts deben ser autosuficientes y generar debate inmediato."},
                 {"role": "user", "content": prompt},
             ],
-            # Subimos la temperatura para que las preguntas sean más originales y variadas
-            temperature=0.7, 
+            temperature=0.7,
         )
         return resp.choices[0].message.content.strip()
     except Exception:
