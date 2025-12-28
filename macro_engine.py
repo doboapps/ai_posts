@@ -23,6 +23,76 @@ HIGHLIGHT_COLORS = [
     (0, 163, 255),  # #00A3FF (azul)
 ]
 DEFAULT_MAX_DRAFTS = 5
+DEFAULT_MAX_RESULTS = 20
+DEFAULT_TIME_RANGE = "week"
+DEFAULT_MAX_AGE_DAYS = 3.0
+DEFAULT_ALLOW_UNDATED_NEWS = True
+DEFAULT_ALLOW_STALE_NEWS = False
+DEFAULT_ALLOW_FALLBACK_SOURCES = True
+DEFAULT_DOMAIN_BIAS_ENABLED = True
+DEFAULT_DOMAIN_BIAS_RESULTS = 10
+
+_ALLOWED_TIME_RANGES = {"day", "week", "month", "year"}
+_OFFICIAL_KEYWORDS = [
+    "oficial",
+    "confirmado",
+    "confirmada",
+    "confirmación",
+    "confirmacion",
+    "comunicado",
+    "parte médico",
+    "parte medico",
+    "anuncia",
+    "anunciado",
+    "oficializa",
+    "oficialmente",
+]
+
+_IMPORTANCE_KEYWORDS = [
+    "lesión",
+    "lesion",
+    "lesiones",
+    "baja",
+    "sanción",
+    "sancion",
+    "sancionado",
+    "sancionada",
+    "alineación",
+    "alineacion",
+    "convocatoria",
+    "convocado",
+    "fichaje",
+    "traspaso",
+    "renovación",
+    "renovacion",
+    "cláusula",
+    "clausula",
+    "marcador",
+    "resultado",
+    "victoria",
+    "derrota",
+    "empate",
+]
+
+_NON_FOOTBALL_HINTS = [
+    "baloncesto",
+    "basket",
+    "nba",
+    "acb",
+    "euroliga",
+    "euroleague",
+    "liga endesa",
+    "liga-endesa",
+    "endesa",
+]
+
+_SECTION_SLUGS = {
+    "barcelona",
+    "fc-barcelona",
+    "barca",
+    "real-madrid",
+    "realmadrid",
+}
 
 # === Búsqueda y filtrado de noticias ===
 def get_hot_macro_news():
@@ -37,27 +107,34 @@ def get_hot_macro_news():
     query = (
         f"{contexto_temporal}, "
         "Real Madrid OR FC Barcelona OR Barça OR Barca, "
-        "lesiones confirmadas, sanciones, alineaciones probables, "
+        "lesiones confirmadas, sanciones, alineaciones confirmadas, "
         "fichajes y mercado, tácticas, estadísticas clave, "
-        "resultados y marcador en LaLiga, Champions League, Copa del Rey"
+        "resultados y marcador en LaLiga, Champions League, Copa del Rey, "
+        "comunicado oficial, parte médico, confirmado"
     )
 
-    payload = {
-        "api_key": api_key,
-        "query": query,
-        "search_depth": "advanced",
-        "max_results": 12,
-        "time_range": "day",
-        "include_raw_content": True
-    }
+    print(f"[*] Escaneando actualidad fútbol: {contexto_temporal}...")
+    time_range = _get_time_range()
+    max_results = _get_max_results()
+    results = _fetch_tavily_results(
+        api_key=api_key,
+        query=query,
+        max_results=max_results,
+        time_range=time_range,
+    )
 
-    try:
-        print(f"[*] Escaneando actualidad fútbol: {contexto_temporal}...")
-        r = requests.post("https://api.tavily.com/search", json=payload, timeout=30)
-        return r.json().get("results", [])
-    except Exception as e:
-        print(f"[!] Error: {e}")
-        return []
+    if _domain_bias_enabled():
+        domain_bias_query = _build_domain_bias_query(_DOMAIN_BIAS_SOURCES)
+        if domain_bias_query:
+            bias_results = _fetch_tavily_results(
+                api_key=api_key,
+                query=f"{query} ({domain_bias_query})",
+                max_results=min(_get_domain_bias_results(), max_results),
+                time_range=time_range,
+            )
+            results = _merge_results(results, bias_results)
+
+    return results
 
 _REAL_TOKENS = [
     "real madrid",
@@ -82,19 +159,44 @@ _BARCA_TOKENS = [
     "nou camp",
 ]
 
-_CLUB_TOKENS = _REAL_TOKENS + _BARCA_TOKENS
-
 _PRIORITY_SOURCES = [
     "as.com",
     "marca.com",
     "sport.es",
     "mundodeportivo.com",
     "eldesmarque.com",
-    "okdiario.com/deportes",
-    "goal.com/es",
-    "theathletic.com/spain",
+    "goal.com",
+    "theathletic.com",
+    "uefa.com",
+    "laliga.com",
+    "realmadrid.com",
+    "fcbarcelona.com",
 ]
-_ALLOWED_SOURCES = list(_PRIORITY_SOURCES)
+_ALLOWED_SOURCES = [
+    *_PRIORITY_SOURCES,
+    "estadiodeportivo.com",
+    "okdiario.com",
+    "cadenaser.com",
+    "cope.es",
+    "rtve.es",
+    "abc.es",
+    "elespanol.com",
+    "elmundo.es",
+    "lavanguardia.com",
+    "rfef.es",
+    "beinsports.com",
+    "besoccer.com",
+]
+_BLACKLISTED_SOURCES = [
+    "tiktok.com",
+    "tiktokcdn.com",
+]
+_DOMAIN_BIAS_SOURCES = [
+    "as.com",
+    "marca.com",
+    "sport.es",
+    "mundodeportivo.com",
+]
 
 
 def _extract_domain(url: str) -> str:
@@ -119,6 +221,115 @@ def _get_max_drafts() -> int:
     return DEFAULT_MAX_DRAFTS
 
 
+def _get_time_range() -> str:
+    raw = (os.getenv("TAVILY_TIME_RANGE") or "").strip().lower()
+    if raw in _ALLOWED_TIME_RANGES:
+        return raw
+    return DEFAULT_TIME_RANGE
+
+
+def _get_max_results() -> int:
+    raw = (os.getenv("TAVILY_MAX_RESULTS") or "").strip()
+    if raw.isdigit():
+        value = int(raw)
+        if 1 <= value <= 50:
+            return value
+    return DEFAULT_MAX_RESULTS
+
+
+def _domain_bias_enabled() -> bool:
+    raw = (os.getenv("TAVILY_DOMAIN_BIAS") or "").strip()
+    if raw == "":
+        return DEFAULT_DOMAIN_BIAS_ENABLED
+    return raw == "1"
+
+
+def _get_domain_bias_results() -> int:
+    raw = (os.getenv("TAVILY_DOMAIN_BIAS_RESULTS") or "").strip()
+    if raw.isdigit():
+        value = int(raw)
+        if 1 <= value <= 50:
+            return value
+    return DEFAULT_DOMAIN_BIAS_RESULTS
+
+
+def _build_domain_bias_query(domains: list[str]) -> str:
+    if not domains:
+        return ""
+    terms = [f"site:{domain}" for domain in domains if domain]
+    return " OR ".join(terms)
+
+
+def _fetch_tavily_results(
+    api_key: Optional[str],
+    query: str,
+    max_results: int,
+    time_range: str,
+) -> list[dict]:
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "search_depth": "advanced",
+        "max_results": max_results,
+        "time_range": time_range,
+        "include_raw_content": True,
+    }
+    try:
+        r = requests.post("https://api.tavily.com/search", json=payload, timeout=30)
+        return r.json().get("results", [])
+    except Exception as exc:
+        print(f"[!] Error: {exc}")
+        return []
+
+
+def _merge_results(primary: list[dict], secondary: list[dict]) -> list[dict]:
+    if not secondary:
+        return primary
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for item in primary + secondary:
+        url = (item.get("url") or "").strip().lower()
+        key = url or (item.get("title") or "").strip().lower()
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        merged.append(item)
+    return merged
+
+
+def _get_max_age_days() -> float:
+    raw = (os.getenv("MAX_NEWS_AGE_DAYS") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_AGE_DAYS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MAX_AGE_DAYS
+    return value if value > 0 else DEFAULT_MAX_AGE_DAYS
+
+
+def _allow_undated_news() -> bool:
+    raw = (os.getenv("ALLOW_UNDATED_NEWS") or "").strip()
+    if raw == "":
+        return DEFAULT_ALLOW_UNDATED_NEWS
+    return raw == "1"
+
+
+def _allow_stale_news() -> bool:
+    raw = (os.getenv("ALLOW_STALE_NEWS") or "").strip()
+    if raw == "":
+        return DEFAULT_ALLOW_STALE_NEWS
+    return raw == "1"
+
+
+def _allow_fallback_sources() -> bool:
+    raw = (os.getenv("ALLOW_FALLBACK_SOURCES") or "").strip()
+    if raw == "":
+        return DEFAULT_ALLOW_FALLBACK_SOURCES
+    return raw == "1"
+
+
 def _priority_rank(item: dict) -> int:
     domain = _extract_domain(item.get("url", ""))
     for idx, priority in enumerate(_PRIORITY_SOURCES):
@@ -134,80 +345,340 @@ def _is_allowed_source(item: dict) -> bool:
     return any(_domain_matches(domain, allowed) for allowed in _ALLOWED_SOURCES)
 
 
-def _prioritize_news_results(news_results: list[dict]) -> list[dict]:
-    buckets: dict[int, list[dict]] = {}
-    for item in news_results:
-        rank = _priority_rank(item)
-        buckets.setdefault(rank, []).append(item)
-    ordered: list[dict] = []
-    for rank in sorted(buckets):
-        bucket = buckets[rank]
-        random.shuffle(bucket)
-        ordered.extend(bucket)
-    return ordered
+def _is_blacklisted_source(item: dict) -> bool:
+    domain = _extract_domain(item.get("url", ""))
+    if not domain:
+        return False
+    return any(_domain_matches(domain, blocked) for blocked in _BLACKLISTED_SOURCES)
+
+
+def _contains_any(text: str, keywords: list[str]) -> bool:
+    return any(keyword in text for keyword in keywords)
+
+
+def _importance_score(text: str) -> float:
+    score = 0.0
+    if _contains_any(text, _OFFICIAL_KEYWORDS):
+        score += 1.0
+    if _contains_any(text, _IMPORTANCE_KEYWORDS):
+        score += 0.5
+    return score
+
+
+def _has_strong_signal(text: str) -> bool:
+    return _contains_any(text, _OFFICIAL_KEYWORDS)
+
+
+def _is_non_football_context(url: str, text: str) -> bool:
+    haystack = f"{url} {text}".lower()
+    return any(hint in haystack for hint in _NON_FOOTBALL_HINTS)
+
+
+def _is_section_like_url(url: str) -> bool:
+    if not url:
+        return True
+    cleaned = url.split("?", 1)[0].split("#", 1)[0]
+    path_part = cleaned.split("//")[-1]
+    parts = path_part.split("/", 1)
+    if len(parts) < 2:
+        return True
+    path = parts[1].strip("/")
+    if not path:
+        return True
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) <= 2 and not any(char.isdigit() for char in path):
+        return True
+    last = segments[-1].lower()
+    if last.endswith(".html"):
+        slug = last[:-5]
+        if slug in _SECTION_SLUGS:
+            return True
+        if not any(char.isdigit() for char in slug) and len(segments) <= 2:
+            return True
+    return False
+
+
+def _split_candidates_by_recency(
+    candidates: list[dict],
+    max_age_days: float,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    if max_age_days <= 0:
+        return candidates, [], []
+
+    now_ts = time.time()
+    max_age_seconds = max_age_days * 86400
+    recent: list[dict] = []
+    undated: list[dict] = []
+    stale: list[dict] = []
+
+    for candidate in candidates:
+        published_ts = candidate["published_ts"]
+        if not published_ts:
+            undated.append(candidate)
+            continue
+        age_seconds = now_ts - published_ts
+        if age_seconds <= max_age_seconds:
+            recent.append(candidate)
+        else:
+            stale.append(candidate)
+
+    return recent, undated, stale
+
+
+def _rank_by_recency(
+    candidates: list[dict],
+    max_age_days: float,
+    allow_undated: bool,
+    allow_stale: bool,
+) -> list[dict]:
+    if not candidates:
+        return []
+    recent, undated, stale = _split_candidates_by_recency(candidates, max_age_days)
+    ranked: list[dict] = []
+    if recent:
+        ranked.extend(_rank_candidates(recent))
+    if allow_undated and undated:
+        ranked.extend(_rank_candidates(undated))
+    if allow_stale and stale:
+        ranked.extend(_rank_candidates(stale))
+    return ranked
+
+
+def _detect_clubs(text: str) -> set[str]:
+    clubs = set()
+    if any(token in text for token in _REAL_TOKENS):
+        clubs.add("real")
+    if any(token in text for token in _BARCA_TOKENS):
+        clubs.add("barca")
+    return clubs
+
+
+def _get_item_text(item: dict) -> str:
+    title = item.get("title", "")
+    content = item.get("content", "")
+    return f"{title} {content}".strip().lower()
+
+
+def _extract_result_score(item: dict) -> float:
+    for key in ("score", "relevancy_score", "relevance_score", "relevance", "confidence"):
+        value = item.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return 0.0
+
+
+def _extract_published_timestamp(item: dict) -> float:
+    for key in ("published_date", "published_at", "published", "date"):
+        value = item.get(key)
+        if not value:
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                cleaned = value.replace("Z", "+00:00")
+                return datetime.fromisoformat(cleaned).timestamp()
+            except ValueError:
+                continue
+    return 0.0
+
+
+def _build_candidate(item: dict, text: str) -> dict:
+    return {
+        "item": item,
+        "text": text,
+        "topic": _classify_topic(text),
+        "clubs": _detect_clubs(text),
+        "score": _extract_result_score(item),
+        "importance": _importance_score(text),
+        "priority": _priority_rank(item),
+        "published_ts": _extract_published_timestamp(item),
+    }
+
+
+def _candidate_key(candidate: dict) -> str:
+    item = candidate["item"]
+    url = (item.get("url") or "").strip().lower()
+    if url:
+        return url
+    title = (item.get("title") or "").strip().lower()
+    if title:
+        return title
+    return str(id(item))
+
+
+def _rank_candidates(candidates: list[dict]) -> list[dict]:
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            -candidate["score"],
+            -candidate["importance"],
+            candidate["priority"],
+            -candidate["published_ts"],
+        ),
+    )
+
+
+def _select_diverse_candidates(
+    candidates: list[dict],
+    max_drafts: int,
+    seen_topics: Optional[set[str]] = None,
+) -> tuple[list[dict], set[str]]:
+    final_selection: list[dict] = []
+    repeats: list[dict] = []
+    topics_seen = set() if seen_topics is None else seen_topics
+
+    for candidate in candidates:
+        topic = candidate["topic"]
+        item = candidate["item"]
+        if topic not in topics_seen:
+            final_selection.append(item)
+            topics_seen.add(topic)
+        else:
+            repeats.append(item)
+
+        if len(final_selection) >= max_drafts:
+            return final_selection, topics_seen
+
+    if len(final_selection) < max_drafts:
+        for item in repeats:
+            final_selection.append(item)
+            if len(final_selection) >= max_drafts:
+                break
+
+    return final_selection, topics_seen
 
 
 def _mentions_target_clubs(text: str) -> bool:
-    lowered = text.lower()
-    return any(token in lowered for token in _CLUB_TOKENS)
+    return bool(_detect_clubs(text))
+
+
+def _select_club_anchors(
+    ranked_candidates: list[dict],
+    max_drafts: int,
+) -> list[dict]:
+    if max_drafts < 2:
+        return []
+
+    anchors: list[dict] = []
+    used_keys: set[str] = set()
+    for club in ("real", "barca"):
+        if len(anchors) >= max_drafts:
+            break
+        for candidate in ranked_candidates:
+            key = _candidate_key(candidate)
+            if key in used_keys:
+                continue
+            if club in candidate["clubs"]:
+                anchors.append(candidate)
+                used_keys.add(key)
+                break
+
+    return anchors
 
 
 def _classify_topic(text: str) -> str:
-    if any(x in text for x in ["clásico", "clasico", "barça vs real", "barca vs real"]):
+    lowered = text.lower()
+    if any(x in lowered for x in ["clásico", "clasico", "barça vs real", "barca vs real"]):
         return "clasico"
-    if any(x in text for x in ["fichaje", "traspaso", "mercado", "cláusula", "clausula"]):
+    if any(x in lowered for x in ["fichaje", "traspaso", "mercado", "cláusula", "clausula"]):
         return "mercado"
-    if any(x in text for x in ["lesión", "lesion", "lesiones", "injury", "sanción", "sancion", "baja"]):
+    if any(x in lowered for x in ["lesión", "lesion", "lesiones", "injury", "sanción", "sancion", "baja"]):
         return "lesiones"
-    if any(x in text for x in ["alineación", "alineacion", "once", "xi", "táctica", "tactica"]):
+    if any(x in lowered for x in ["alineación", "alineacion", "once", "xi", "táctica", "tactica"]):
         return "tactica"
-    if any(x in text for x in ["champions", "europa league", "liga de campeones", "ucl"]):
+    if any(x in lowered for x in ["champions", "europa league", "liga de campeones", "ucl"]):
         return "champions"
-    if any(x in text for x in ["laliga", "liga", "copa del rey", "supercopa"]):
+    if any(x in lowered for x in ["laliga", "liga", "copa del rey", "supercopa"]):
         return "competicion"
     return "partido"
 
 
 def select_diverse_news(news_results):
-    final_selection = []
-    temas_vistos = set()
-    repeated_candidates = []
     max_drafts = _get_max_drafts()
+    if not news_results:
+        return []
 
-    # Priorizamos fuentes clave y mezclamos dentro de cada grupo
-    news_results = _prioritize_news_results(news_results)
-
+    allow_fallback_sources = _allow_fallback_sources()
+    preferred_candidates: list[dict] = []
+    fallback_candidates: list[dict] = []
     for item in news_results:
-        if not _is_allowed_source(item):
+        if _is_blacklisted_source(item):
+            continue
+        is_preferred = _is_allowed_source(item)
+        if not is_preferred and not allow_fallback_sources:
             continue
 
-        title = item.get("title", "")
-        content = item.get("content", "")
-        text = f"{title} {content}".lower()
-
-        # 1. Solo queremos noticias de Real Madrid o FC Barcelona
+        text = _get_item_text(item)
         if not _mentions_target_clubs(text):
             continue
+        url = item.get("url", "")
+        if _is_non_football_context(url, text):
+            continue
+        if _is_section_like_url(url):
+            continue
 
-        # 2. Clasificación para diversidad de temas futbolísticos
-        tema = _classify_topic(text)
-
-        # 3. Priorizamos temas distintos, pero guardamos repetidos como fallback
-        if tema not in temas_vistos:
-            final_selection.append(item)
-            temas_vistos.add(tema)
+        candidate = _build_candidate(item, text)
+        if is_preferred:
+            preferred_candidates.append(candidate)
         else:
-            repeated_candidates.append(item)
+            fallback_candidates.append(candidate)
 
-        # Límite configurable de noticias para no saturar
-        if len(final_selection) >= max_drafts:
-            break
+    if not preferred_candidates and not fallback_candidates:
+        return []
+
+    max_age_days = _get_max_age_days()
+    allow_undated = _allow_undated_news()
+    allow_stale = _allow_stale_news()
+
+    ranked_candidates = _rank_by_recency(
+        preferred_candidates, max_age_days, allow_undated, allow_stale
+    )
+    if allow_fallback_sources and fallback_candidates:
+        ranked_candidates.extend(
+            _rank_by_recency(fallback_candidates, max_age_days, allow_undated, allow_stale)
+        )
+
+    if not ranked_candidates:
+        return []
+
+    anchors = _select_club_anchors(ranked_candidates, max_drafts)
+    selected_keys = {_candidate_key(candidate) for candidate in anchors}
+    final_selection = [candidate["item"] for candidate in anchors]
+    seen_topics = {candidate["topic"] for candidate in anchors}
+
+    remaining_candidates = [
+        candidate
+        for candidate in ranked_candidates
+        if _candidate_key(candidate) not in selected_keys
+    ]
+
+    strong_candidates: list[dict] = []
+    fallback_candidates: list[dict] = []
+    for candidate in remaining_candidates:
+        if _has_strong_signal(candidate["text"]):
+            strong_candidates.append(candidate)
+        else:
+            fallback_candidates.append(candidate)
 
     if len(final_selection) < max_drafts:
-        for item in repeated_candidates:
-            final_selection.append(item)
-            if len(final_selection) >= max_drafts:
-                break
+        remaining = max_drafts - len(final_selection)
+        extra, seen_topics = _select_diverse_candidates(
+            strong_candidates, remaining, seen_topics
+        )
+        final_selection.extend(extra)
+
+    if len(final_selection) < max_drafts:
+        remaining = max_drafts - len(final_selection)
+        extra, _ = _select_diverse_candidates(
+            fallback_candidates, remaining, seen_topics
+        )
+        final_selection.extend(extra)
 
     return final_selection
 

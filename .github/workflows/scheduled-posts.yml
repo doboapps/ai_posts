@@ -58,4 +58,12 @@ jobs:
           RUN_END_HOUR: ${{ vars.RUN_END_HOUR }}
           MAX_DRAFTS: ${{ vars.MAX_DRAFTS }}
           SEND_EMPTY_MESSAGE: ${{ vars.SEND_EMPTY_MESSAGE }}
+          TAVILY_TIME_RANGE: ${{ vars.TAVILY_TIME_RANGE }}
+          TAVILY_MAX_RESULTS: ${{ vars.TAVILY_MAX_RESULTS }}
+          MAX_NEWS_AGE_DAYS: ${{ vars.MAX_NEWS_AGE_DAYS }}
+          ALLOW_UNDATED_NEWS: ${{ vars.ALLOW_UNDATED_NEWS }}
+          ALLOW_STALE_NEWS: ${{ vars.ALLOW_STALE_NEWS }}
+          ALLOW_FALLBACK_SOURCES: ${{ vars.ALLOW_FALLBACK_SOURCES }}
+          TAVILY_DOMAIN_BIAS: ${{ vars.TAVILY_DOMAIN_BIAS }}
+          TAVILY_DOMAIN_BIAS_RESULTS: ${{ vars.TAVILY_DOMAIN_BIAS_RESULTS }}
         run: python scheduled_run.py
