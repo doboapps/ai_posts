@@ -1,203 +1,743 @@
+import calendar
+import html
 import os
-import random
 import re
-import textwrap
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
+import feedparser
 import requests
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover (py<3.9)
+    ZoneInfo = None  # type: ignore[misc,assignment]
 
 load_dotenv()
 
+# === Configuración y constantes ===
+DEFAULT_MAX_DRAFTS = 5
+DEFAULT_RSS_TIMEOUT = 20
+DEFAULT_RSS_MAX_ITEMS_PER_FEED = 25
+DEFAULT_RSS_CONTENT_LIMIT = 1200
+DEFAULT_MAX_AGE_DAYS = 3.0
+DEFAULT_ALLOW_UNDATED_NEWS = True
+DEFAULT_ALLOW_STALE_NEWS = False
+DEFAULT_ONLY_TODAY = False
+
+_NON_FOOTBALL_HINTS = [
+    "baloncesto",
+    "basket",
+    "nba",
+    "acb",
+    "euroliga",
+    "euroleague",
+    "liga endesa",
+    "liga-endesa",
+    "endesa",
+    'femenino',
+]
+
+_BLOCKED_URL_CONTAINS = [
+    "mercado-de-fichajes-en-directo",
+]
+
+_SECTION_SLUGS = {
+    "barcelona",
+    "fc-barcelona",
+    "barca",
+    "real-madrid",
+    "realmadrid",
+}
+
+_STOPWORDS = {
+    "para",
+    "sobre",
+    "desde",
+    "hasta",
+    "entre",
+    "tras",
+    "ante",
+    "contra",
+    "cuando",
+    "donde",
+    "como",
+    "porque",
+    "pero",
+    "aunque",
+    "esta",
+    "este",
+    "estos",
+    "estas",
+    "del",
+    "las",
+    "los",
+    "una",
+    "uno",
+    "unos",
+    "unas",
+    "con",
+    "sin",
+    "por",
+    "que",
+    "sus",
+    "su",
+    "al",
+}
+
+_BAD_QUESTION_STARTS = (
+    "¿por qué",
+    "¿de verdad",
+    "¿tan ",
+    "¿hasta cuándo",
+    "¿si ",
+)
+
+_RSS_SOURCES = [
+    {"name": "Marca", "url": "https://e00-xlk-ue-marca.uecdn.es/rss/futbol.xml"},
+    {"name": "Sport", "url": "https://www.sport.es/es/rss/barca/rss.xml"},
+    {"name": "AS", "url": "https://feeds.as.com/mrss-s/pages/as/site/as.com/section/futbol/portada/"},
+    {"name": "El Periodico", "url": "https://www.elperiodico.com/es/rss/barca/rss.xml"},
+    {"name": "El Pais", "url": "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/deportes/portada"},
+    {"name": "Mundo Deportivo", "url": "https://www.mundodeportivo.com/feed/rss/portada"},
+]
+
+# === Búsqueda y filtrado de noticias ===
 def get_hot_macro_news():
-    api_key = os.getenv("TAVILY_API_KEY")
-    now = datetime.now()
+    print("[*] Escaneando RSS de futbol...")
+    results: list[dict] = []
+    for source in _RSS_SOURCES:
+        source_results = _fetch_rss_source(source)
+        results = _merge_results(results, source_results)
+    return results
 
-    # Lógica de ventana: Si estamos a final de mes/trimestre, miramos al frente
-    # Si quedan menos de 10 días para el mes siguiente, pivotamos la búsqueda
-    if (now + timedelta(days=10)).month != now.month:
-        proximo_mes = (now + timedelta(days=10)).strftime("%B")
-        anio_objetivo = (now + timedelta(days=10)).year
-        contexto_temporal = f"expectations and early signals for {proximo_mes} {anio_objetivo}"
-    else:
-        contexto_temporal = f"current market drivers and volatility for {now.strftime('%B %Y')}"
+_REAL_TOKENS = [
+    "real madrid",
+    "realmadrid",
+    "real-madrid",
+    "bernabeu",
+    "bernabéu",
+    "santiago bernabéu",
+    "los blancos",
+    "merengue",
+]
 
-    # Buscamos por "catalizadores" y "sorpresas", no por etiquetas fijas
-    query = (
-        f"{contexto_temporal}, "
-        "institutional rebalancing and dark pool activity, "
-        "breaking financial news with immediate price impact, "
-        "unusual options flow and market sentiment shifts"
-    )
+_BARCA_TOKENS = [
+    "fc barcelona",
+    "barcelona",
+    "barça",
+    "barca",
+    "fcb",
+    "blaugrana",
+    "culé",
+    "camp nou",
+    "nou camp",
+]
 
-    payload = {
-        "api_key": api_key,
-        "query": query,
-        "search_depth": "advanced",
-        "max_results": 12,
-        "time_range": "day",
-        "include_raw_content": True
+_PRIORITY_SOURCES = [
+    "marca.com",
+    "sport.es",
+    "as.com",
+    "elperiodico.com",
+    "elpais.com",
+    "mundodeportivo.com",
+]
+_ALLOWED_SOURCES = list(_PRIORITY_SOURCES)
+_AGGREGATOR_DOMAINS = [
+    "news.google.com",
+    "feedproxy.google.com",
+    "feedburner.com",
+]
+
+
+def _extract_domain(url: str) -> str:
+    if not url:
+        return ""
+    domain = url.split("//")[-1].split("/")[0].lower()
+    return domain.replace("www.", "")
+
+
+def _domain_matches(domain: str, priority: str) -> bool:
+    if not domain or not priority:
+        return False
+    return domain == priority or domain.endswith(f".{priority}")
+
+
+def _pick_entry_url(entry: dict) -> str:
+    candidates: list[str] = []
+    primary = (entry.get("link") or "").strip()
+    if primary:
+        candidates.append(primary)
+    for link_info in entry.get("links") or []:
+        href = (link_info.get("href") or "").strip()
+        if href:
+            candidates.append(href)
+
+    for url in candidates:
+        domain = _extract_domain(url)
+        if not domain:
+            continue
+        if any(_domain_matches(domain, agg) for agg in _AGGREGATOR_DOMAINS):
+            continue
+        return url
+
+    return candidates[0] if candidates else ""
+
+
+def _get_max_drafts() -> int:
+    raw = (os.getenv("MAX_DRAFTS") or "").strip()
+    if raw.isdigit():
+        value = int(raw)
+        if value > 0:
+            return value
+    return DEFAULT_MAX_DRAFTS
+
+
+def _get_rss_timeout() -> int:
+    raw = (os.getenv("RSS_TIMEOUT_SECS") or "").strip()
+    if raw.isdigit():
+        value = int(raw)
+        if value > 0:
+            return value
+    return DEFAULT_RSS_TIMEOUT
+
+
+def _get_rss_max_items_per_feed() -> int:
+    raw = (os.getenv("RSS_MAX_ITEMS_PER_FEED") or "").strip()
+    if raw.isdigit():
+        value = int(raw)
+        if value > 0:
+            return value
+    return DEFAULT_RSS_MAX_ITEMS_PER_FEED
+
+
+def _get_rss_content_limit() -> int:
+    raw = (os.getenv("RSS_CONTENT_LIMIT") or "").strip()
+    if raw.isdigit():
+        value = int(raw)
+        if value > 0:
+            return value
+    return DEFAULT_RSS_CONTENT_LIMIT
+
+
+def _strip_html(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"<[^>]+>", " ", text)
+    return html.unescape(cleaned)
+
+
+def _compact_spaces(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _extract_entry_text(entry: dict) -> str:
+    summary = (entry.get("summary") or entry.get("description") or "").strip()
+    summary_detail = ""
+    detail = entry.get("summary_detail") or {}
+    if isinstance(detail, dict):
+        summary_detail = (detail.get("value") or "").strip()
+    content_value = ""
+    contents = entry.get("content") or []
+    if contents:
+        content_value = (contents[0].get("value") or "").strip()
+    raw_text = " ".join(
+        part for part in [summary, summary_detail, content_value] if part
+    ).strip()
+    cleaned = _compact_spaces(_strip_html(raw_text))
+    limit = _get_rss_content_limit()
+    if limit > 0 and len(cleaned) > limit:
+        trimmed = cleaned[:limit].rsplit(" ", 1)[0].strip()
+        return trimmed or cleaned[:limit]
+    return cleaned
+
+
+def _extract_entry_timestamp(entry: dict) -> float:
+    for key in ("published_parsed", "updated_parsed", "created_parsed"):
+        value = entry.get(key)
+        if value:
+            try:
+                return float(calendar.timegm(value))
+            except Exception:
+                continue
+    return 0.0
+
+
+def _entry_to_item(entry: dict, source_name: str) -> Optional[dict]:
+    title = (entry.get("title") or "").strip()
+    url = _pick_entry_url(entry)
+    if not title or not url:
+        return None
+    content = _extract_entry_text(entry)
+    return {
+        "title": title,
+        "content": content,
+        "url": url,
+        "source": source_name,
+        "published_ts": _extract_entry_timestamp(entry),
     }
 
+
+def _fetch_rss_source(source: dict) -> list[dict]:
+    url = (source.get("url") or "").strip()
+    name = source.get("name") or "RSS"
+    if not url:
+        return []
     try:
-        print(f"[*] Escaneando ventana de impacto: {contexto_temporal}...")
-        r = requests.post("https://api.tavily.com/search", json=payload, timeout=30)
-        return r.json().get("results", [])
-    except Exception as e:
-        print(f"[!] Error: {e}")
+        response = requests.get(
+            url,
+            timeout=_get_rss_timeout(),
+            headers={"User-Agent": "Mozilla/5.0 (compatible; ai_posts/1.0)"},
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"[!] RSS error ({name}): {exc}")
         return []
 
+    feed = feedparser.parse(response.content)
+    entries = feed.entries or []
+    max_items = _get_rss_max_items_per_feed()
+    if max_items > 0:
+        entries = entries[:max_items]
+
+    results: list[dict] = []
+    for entry in entries:
+        item = _entry_to_item(entry, name)
+        if item:
+            results.append(item)
+    return results
+
+
+def _merge_results(primary: list[dict], secondary: list[dict]) -> list[dict]:
+    if not secondary:
+        return primary
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for item in primary + secondary:
+        url = (item.get("url") or "").strip().lower()
+        key = url or (item.get("title") or "").strip().lower()
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        merged.append(item)
+    return merged
+
+
+def _get_max_age_days() -> float:
+    raw = (os.getenv("MAX_NEWS_AGE_DAYS") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_AGE_DAYS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MAX_AGE_DAYS
+    return value if value > 0 else DEFAULT_MAX_AGE_DAYS
+
+
+def _only_today() -> bool:
+    raw = (os.getenv("ONLY_TODAY") or "").strip()
+    if raw == "":
+        return DEFAULT_ONLY_TODAY
+    return raw == "1"
+
+
+def _get_news_timezone() -> Optional[datetime.tzinfo]:
+    tz_name = (os.getenv("NEWS_TZ") or os.getenv("RUN_TZ") or "UTC").strip() or "UTC"
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _is_today(published_ts: float) -> bool:
+    if not published_ts:
+        return False
+    tzinfo = _get_news_timezone()
+    if tzinfo:
+        return datetime.fromtimestamp(published_ts, tz=tzinfo).date() == datetime.now(tzinfo).date()
+    return datetime.utcfromtimestamp(published_ts).date() == datetime.utcnow().date()
+
+
+def _allow_undated_news() -> bool:
+    raw = (os.getenv("ALLOW_UNDATED_NEWS") or "").strip()
+    if raw == "":
+        return DEFAULT_ALLOW_UNDATED_NEWS
+    return raw == "1"
+
+
+def _allow_stale_news() -> bool:
+    raw = (os.getenv("ALLOW_STALE_NEWS") or "").strip()
+    if raw == "":
+        return DEFAULT_ALLOW_STALE_NEWS
+    return raw == "1"
+
+
+def _priority_rank(item: dict) -> int:
+    domain = _extract_domain(item.get("url", ""))
+    for idx, priority in enumerate(_PRIORITY_SOURCES):
+        if _domain_matches(domain, priority):
+            return idx
+    return len(_PRIORITY_SOURCES) + 1
+
+
+def _is_allowed_source(item: dict) -> bool:
+    domain = _extract_domain(item.get("url", ""))
+    if not domain:
+        return False
+    return any(_domain_matches(domain, allowed) for allowed in _ALLOWED_SOURCES)
+
+
+def _is_non_football_context(url: str, text: str) -> bool:
+    haystack = f"{url} {text}".lower()
+    return any(hint in haystack for hint in _NON_FOOTBALL_HINTS)
+
+
+def _is_blocked_url(url: str) -> bool:
+    cleaned = (url or "").lower()
+    if not cleaned:
+        return False
+    return any(token in cleaned for token in _BLOCKED_URL_CONTAINS)
+
+
+def _is_section_like_url(url: str) -> bool:
+    if not url:
+        return True
+    cleaned = url.split("?", 1)[0].split("#", 1)[0]
+    path_part = cleaned.split("//")[-1]
+    parts = path_part.split("/", 1)
+    if len(parts) < 2:
+        return True
+    path = parts[1].strip("/")
+    if not path:
+        return True
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) <= 2 and not any(char.isdigit() for char in path):
+        return True
+    last = segments[-1].lower()
+    if last.endswith(".html"):
+        slug = last[:-5]
+        if slug in _SECTION_SLUGS:
+            return True
+        if not any(char.isdigit() for char in slug) and len(segments) <= 2:
+            return True
+    return False
+
+
+def _extract_published_timestamp(item: dict) -> float:
+    for key in ("published_ts", "published_date", "published_at", "published", "date"):
+        value = item.get(key)
+        if not value:
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                cleaned = value.replace("Z", "+00:00")
+                return datetime.fromisoformat(cleaned).timestamp()
+            except ValueError:
+                continue
+    return 0.0
+
+
+def _detect_clubs(text: str) -> set[str]:
+    clubs = set()
+    if any(token in text for token in _REAL_TOKENS):
+        clubs.add("real")
+    if any(token in text for token in _BARCA_TOKENS):
+        clubs.add("barca")
+    return clubs
+
+
+def _extract_keywords(text: str, limit: int = 8) -> list[str]:
+    tokens = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{4,}", text or "")
+    keywords: list[str] = []
+    seen = set()
+    for token in tokens:
+        normalized = token.lower()
+        if normalized in _STOPWORDS:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        keywords.append(token)
+        if len(keywords) >= limit:
+            break
+    return keywords
+
+
+def _extract_question_line(text: str) -> str:
+    if not text:
+        return ""
+    parts = text.split("###", 1)
+    body = parts[1] if len(parts) > 1 else parts[0]
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if lower.startswith("fuente:"):
+            continue
+        if line.startswith("#"):
+            continue
+        return line
+    return ""
+
+
+def _question_needs_regen(question: str, title: str, content: str) -> bool:
+    if not question:
+        return True
+    lower = question.strip().lower()
+    if len(lower) < 35:
+        return True
+    if any(lower.startswith(start) for start in _BAD_QUESTION_STARTS):
+        return True
+    keywords = _extract_keywords(title)
+    if not keywords:
+        keywords = _extract_keywords(content)
+    if keywords and not any(keyword.lower() in lower for keyword in keywords):
+        return True
+    return False
+
+
+def _club_label_from_set(clubs: set[str]) -> Optional[str]:
+    if clubs == {"real"}:
+        return "real"
+    if clubs == {"barca"}:
+        return "barca"
+    return None
+
+
 def select_diverse_news(news_results):
-    final_selection = []
-    temas_vistos = set()
+    max_drafts = _get_max_drafts()
+    if not news_results:
+        return []
 
-    # Mezclamos un poco para no coger siempre lo mismo si hay muchos resultados
-    random.shuffle(news_results)
+    only_today = _only_today()
+    allow_undated = _allow_undated_news()
+    allow_stale = _allow_stale_news()
+    cutoff_ts = None
+    if not only_today:
+        max_age_days = _get_max_age_days()
+        if max_age_days > 0:
+            cutoff_ts = time.time() - (max_age_days * 86400)
 
+    candidates: list[dict] = []
     for item in news_results:
-        title = item.get("title", "")
-        content = item.get("content", "")
-        text = (title + " " + content).lower()
-
-        # 1. Filtro de Datos: Priorizamos noticias con movimiento numérico
-        has_numbers = any(char.isdigit() for char in text)
-        if not has_numbers:
+        if not _is_allowed_source(item):
             continue
 
-        # 2. Nueva lógica de categorización más amplia
-        if any(x in text for x in ["gold", "oro", "silver", "plata"]):
-            tema = "metales"
-        elif any(x in text for x in ["gdp", "pib", "growth", "crecimiento"]):
-            tema = "crecimiento"
-        elif any(x in text for x in ["fed", "ecb", "bce", "rates", "tipos", "powell", "lagarde"]):
-            tema = "bancos_centrales"
-        elif any(x in text for x in ["altman", "musk", "saylor", "burry", "buffett", "nvidia", "apple", "tesla", "openai"]):
-            # Capturamos a los "Market Movers" que mencionabas
-            tema = "market_movers"
-        elif any(x in text for x in ["ai", "ia", "tech", "tecnología", "breakthrough", "disrupción"]):
-            tema = "disrupcion_tech"
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+        title_url_text = f"{title} {url}".strip().lower()
+        clubs = _detect_clubs(title_url_text)
+        if not clubs:
+            continue
+        if _is_blocked_url(url):
+            continue
+        if _is_non_football_context(url, title_url_text):
+            continue
+        if _is_section_like_url(url):
+            continue
+
+        published_ts = _extract_published_timestamp(item)
+        if not published_ts:
+            if only_today or not allow_undated:
+                continue
+        if published_ts and only_today and not _is_today(published_ts):
+            continue
+        if not only_today and published_ts and cutoff_ts is not None and published_ts < cutoff_ts:
+            if not allow_stale:
+                continue
+
+        key = (url or title).strip().lower()
+        candidates.append(
+            {
+                "item": item,
+                "priority": _priority_rank(item),
+                "published_ts": published_ts or 0.0,
+                "clubs": clubs,
+                "key": key,
+            }
+        )
+
+    if not candidates:
+        return []
+
+    candidates.sort(
+        key=lambda candidate: (
+            -candidate["published_ts"],
+            candidate["priority"],
+        )
+    )
+
+    if max_drafts < 2 or max_drafts % 2 != 0:
+        selected_items: list[dict] = []
+        for candidate in candidates[:max_drafts]:
+            item = candidate["item"]
+            item["club"] = _club_label_from_set(candidate["clubs"])
+            selected_items.append(item)
+        return selected_items
+
+    target_per_club = max_drafts // 2
+    real_count = 0
+    barca_count = 0
+    selected: list[dict] = []
+    selected_keys: set[str] = set()
+
+    for candidate in candidates:
+        if len(selected) >= max_drafts:
+            break
+        clubs = candidate["clubs"]
+        if not clubs:
+            continue
+
+        assigned_club: Optional[str] = None
+        if clubs == {"real"}:
+            if real_count < target_per_club:
+                assigned_club = "real"
+        elif clubs == {"barca"}:
+            if barca_count < target_per_club:
+                assigned_club = "barca"
         else:
-            tema = "otros_impacto"
+            if real_count < target_per_club or barca_count < target_per_club:
+                if real_count < target_per_club and barca_count < target_per_club:
+                    if (target_per_club - real_count) >= (target_per_club - barca_count):
+                        assigned_club = "real"
+                    else:
+                        assigned_club = "barca"
+                elif real_count < target_per_club:
+                    assigned_club = "real"
+                else:
+                    assigned_club = "barca"
 
-        # 3. Solo añadimos si el tema no está repetido en este ciclo
-        if tema not in temas_vistos:
-            final_selection.append(item)
-            temas_vistos.add(tema)
+        if assigned_club:
+            key = candidate["key"]
+            if key in selected_keys:
+                continue
+            candidate["item"]["club"] = assigned_club
+            selected.append(candidate)
+            selected_keys.add(key)
+            if assigned_club == "real":
+                real_count += 1
+            else:
+                barca_count += 1
 
-        # Límite de 3 noticias por hora para no saturar
-        if len(final_selection) >= 3:
+        if real_count >= target_per_club and barca_count >= target_per_club:
             break
 
-    return final_selection
+    if len(selected) < max_drafts:
+        for candidate in candidates:
+            if len(selected) >= max_drafts:
+                break
+            key = candidate["key"]
+            if key in selected_keys:
+                continue
+            if not candidate["item"].get("club"):
+                candidate["item"]["club"] = _club_label_from_set(candidate["clubs"])
+            selected.append(candidate)
+            selected_keys.add(key)
 
-def generate_expert_post(client: OpenAI, news_content: str, source_name: str):
+    return [candidate["item"] for candidate in selected[:max_drafts]]
+
+
+# === Generación de contenido ===
+def generate_expert_post(
+    client: OpenAI,
+    news_title: str,
+    news_content: str,
+    source_name: str,
+):
     suggested_handle = _guess_source_handle(source_name) or source_name
-    prompt = f"""
-NOTICIA: {news_content}
+    title = _normalize_spaces(news_title)
+    content = _normalize_spaces(news_content)
+    if content and title:
+        noticia = f"{title}. {content}"
+    else:
+        noticia = title or content
+
+    # MODIFICACIÓN: Prompt diseñado para preguntas incisivas y concretas.
+    base_prompt = f"""
+NOTICIA: {noticia}
 MEDIO: {source_name}
 HANDLE_SUGERIDO: {suggested_handle}
 
 TAREA: Devuelve una respuesta dividida en 2 partes usando EXACTAMENTE el separador ###.
 
-PARTE 1 (IMAGEN):
-- Análisis macro corto + dato(s) numéricos + Probabilidad específica.
-- NO incluyas hashtags ni fuentes aquí.
+PARTE 1 (RESUMEN):
+- Resumen de la noticia, máximo 170 caracteres.
+- Texto limpio, sin etiquetas tipo "Resumen:".
 
 ###
 
-PARTE 2 (POST PARA X):
-- Una PREGUNTA que se entienda sola, incluyendo el contexto y la cifra clave (ej: "¿Es realista que el Bitcoin alcance los 150K tras este último movimiento de Saylor?").
+PARTE 2 (PREGUNTA + FUENTE + HASHTAGS):
+- Genera una PREGUNTA CORTA (máximo 85 caracteres), 1 línea.
+- Tono: incisivo y directo, sin humor forzado pero con algo sarcasmo.
+- Debe ser concreta y polémica: plantea una contradicción o doble rasero del hecho.
+- Incluye al menos 1 elemento literal de NOTICIA (nombre propio, club o competición).
+- NO preguntes datos obvios (ej: "¿Quién ganó?"). Cuestiona el "cómo" o el "por qué".
+- EVITA muletillas genéricas como: "¿Hasta cuándo?", "¿Tan difícil?", "¿De verdad?".
+- NO empieces con "¿Por qué", "¿De verdad", "¿Tan", "¿Hasta cuándo".
+- NO repitas el resumen.
 - 1 línea con la fuente: "Fuente: {suggested_handle}".
-- 1 línea con 1 o 2 hashtags (trending).
+- 1 línea final con 1 hashtag que sea el más posible trending topic relacionado con el tema.
 
-REGLAS:
-1. IDIOMA: Español de España.
-2. AUTONOMÍA: El post debe entenderse sin mirar la imagen. Prohibido usar "esta noticia" o "¿llegará a ese precio?". Nombra el precio y el activo.
-3. ESTILO: Analista senior, directo y provocador.
+REGLAS GENERALES:
+1. IDIOMA: Español de España (coloquial futbolero).
+2. SIN ICONOS NI EMOJIS.
+3. ENFOQUE: Solo Real Madrid o FC Barcelona.
+4. RIGOR: Usa solo información explícita de NOTICIA. No inventes contexto (tabla, entrenador, resultados, fichajes, lesiones o premios).
+5. NOMBRES: No menciones personas o equipos que no aparezcan en NOTICIA.
+6. SI HAY POCA INFORMACIÓN: Haz una pregunta general sin afirmar hechos externos.
 """
-    try:
-        resp = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "Generas contenido financiero de alto impacto para X. Tus posts deben ser autosuficientes y generar debate inmediato."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return None
+    keywords = _extract_keywords(title) or _extract_keywords(content)
+    keyword_hint = ", ".join(keywords[:5])
+    retry_note = ""
+    last_response = None
 
-def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    font_paths = [
-        "/System/Library/Fonts/SFNS.ttf",
-        "/System/Library/Fonts/SFNSDisplay.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/Library/Fonts/Arial.ttf",
-        "/Library/Fonts/Helvetica.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
-    for path in font_paths:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size=size)
-            except OSError:
-                continue
-    return ImageFont.load_default()
-
-
-def _wrap_text(text: str, draw: ImageDraw.ImageDraw, font: ImageFont.ImageFont, max_width: int):
-    words = text.split()
-    if not words:
-        return [""]
-
-    lines = []
-    current = words[0]
-    for word in words[1:]:
-        test_line = f"{current} {word}"
-        width = draw.textbbox((0, 0), test_line, font=font)[2]
-        if width <= max_width:
-            current = test_line
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-    return lines
-
-
-def _extract_probability_line(text: str) -> str:
-    for line in text.splitlines():
-        if "probabilidad" in line.lower():
-            return line.strip()
-    match = re.search(r"(Probabilidad[^.\n]*)(?:[.\n]|$)", text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return "Probabilidad: N/D"
-
-
-def _extract_hashtags(text: str, max_count: int = 2) -> list[str]:
-    tags = re.findall(r"#([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+)", text)
-    unique: list[str] = []
-    seen = set()
-    for tag in tags:
-        normalized = f"#{tag}"
-        key = normalized.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(normalized)
-        if len(unique) >= max_count:
+    for _ in range(2):
+        prompt = base_prompt + retry_note
+        try:
+            resp = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "Eres un analista de fútbol incisivo y viral en X, pero riguroso: no inventas datos ni contexto, y evitas muletillas o frases vacías."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.7,
+            )
+        except Exception:
             break
-    return unique
+
+        content_text = resp.choices[0].message.content.strip()
+        if not content_text:
+            continue
+        last_response = content_text
+
+        question = _extract_question_line(content_text)
+        if not _question_needs_regen(question, title, content):
+            return content_text
+
+        if keyword_hint:
+            retry_note = (
+                "\n\nREINTENTO: La pregunta fue genérica. Devuelve de nuevo las 2 partes. "
+                "La pregunta debe incluir al menos uno de estos términos: "
+                f"{keyword_hint}."
+            )
+        else:
+            retry_note = (
+                "\n\nREINTENTO: La pregunta fue genérica. Devuelve de nuevo las 2 partes."
+            )
+
+    return last_response
+
+# === Utilidades de texto ===
+def _normalize_spaces(text: str) -> str:
+    return " ".join((text or "").split()).strip()
 
 
 def _strip_analysis_prefix(text: str) -> str:
@@ -220,308 +760,10 @@ def _guess_source_handle(source_name: str) -> Optional[str]:
         handle = f"@{base}"
     return handle[:30]
 
-def _compose_short_post(summary: str, source: str, hashtags: list[str]) -> str:
-    parts: list[str] = []
-    summary = " ".join((summary or "").split()).strip()
-    if summary:
-        parts.append(summary)
-    source = (source or "").strip()
-    if source:
-        parts.append(f". Fuente: {source}")
-    tags = [t for t in (hashtags or []) if t]
-    if tags:
-        parts.append(" ".join(tags[:2]))
-    return "\n".join(parts).strip()
 
-
-def _extract_macro_analysis(text: str) -> str:
-    cleaned = re.sub(r"#\w+", "", text).strip()
-    lines: list[str] = []
-
-    for raw_line in cleaned.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        line = _strip_analysis_prefix(line)
-        if not line:
-            continue
-
-        lower = line.lower()
-        if lower.startswith("fuente:"):
-            continue
-
-        prob_index = lower.find("probabilidad")
-        if prob_index != -1:
-            prefix = line[:prob_index].strip()
-            if prefix:
-                prefix = re.split(r"[¿?]", prefix, maxsplit=1)[0].strip()
-                if prefix:
-                    lines.append(prefix)
-            break
-
-        line = re.split(r"[¿?]", line, maxsplit=1)[0].strip()
-        if not line:
-            continue
-        lines.append(line)
-
-    paragraph = " ".join(lines).strip()
-    paragraph = _strip_analysis_prefix(paragraph)
-    paragraph = re.sub(r"\s{2,}", " ", paragraph)
-    return paragraph or "Actualización macro."
-
-
-def _extract_very_brief_summary(macro_analysis: str, max_chars: int = 120) -> str:
-    text = " ".join((macro_analysis or "").split()).strip()
-    if not text:
-        return "Actualización macro."
-
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    candidate = (sentences[0] or "").strip() if sentences else text
-    if not candidate:
-        candidate = text
-
-    if len(candidate) <= max_chars:
-        return candidate
-    truncated = candidate[: max_chars - 1].rstrip()
-    return truncated + "…"
-
-
-_HIGHLIGHT_PATTERN = re.compile(r"(\S*(?:\d|[$%])\S*)")
-
-
-def _draw_highlighted_line(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    line: str,
-    font: ImageFont.ImageFont,
-    base_fill: tuple[int, int, int],
-    highlight_fill: tuple[int, int, int],
-):
-    cursor_x = x
-    parts = re.split(_HIGHLIGHT_PATTERN, line)
-    for part in parts:
-        if part == "":
-            continue
-        is_highlight = bool(_HIGHLIGHT_PATTERN.fullmatch(part))
-        fill = highlight_fill if is_highlight else base_fill
-        draw.text((cursor_x, y), part, font=font, fill=fill)
-        bbox = draw.textbbox((0, 0), part, font=font)
-        cursor_x += bbox[2] - bbox[0]
-
-
-def _extract_summary_word(text: str, fallback: str = "") -> str:
-    fallback = (fallback or "").strip()
-    if fallback and len(fallback.split()) == 1:
-        return re.sub(r"^[@#]+", "", fallback).upper()
-
-    hashtags = re.findall(r"#([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+)", text)
-    if hashtags:
-        return hashtags[0].upper()
-
-    lowered = text.lower()
-    topic_map = [
-        ("fed", "FED"),
-        ("powell", "FED"),
-        ("bce", "BCE"),
-        ("ecb", "BCE"),
-        ("pib", "PIB"),
-        ("gdp", "PIB"),
-        ("inflación", "INFLACIÓN"),
-        ("inflation", "INFLACIÓN"),
-        ("tipos", "TIPOS"),
-        ("rates", "TIPOS"),
-        ("oro", "ORO"),
-        ("gold", "ORO"),
-        ("plata", "PLATA"),
-        ("silver", "PLATA"),
-        ("arancel", "ARANCELES"),
-        ("tariff", "ARANCELES"),
-        ("recesión", "RECESIÓN"),
-        ("recession", "RECESIÓN"),
-    ]
-    for needle, label in topic_map:
-        if needle in lowered:
-            return label
-
-    return "MACRO"
-
-
-def _extract_question_text(text: str) -> str:
-    candidates = []
-    for line in text.splitlines():
-        cleaned = line.strip()
-        if not cleaned:
-            continue
-        if cleaned.lower().startswith("fuente:"):
-            continue
-        if "?" in cleaned or "¿" in cleaned:
-            candidates.append(cleaned)
-
-    if candidates:
-        return candidates[-1]
-
-    last_q = text.rfind("?")
-    if last_q == -1:
-        return "¿Cómo lo está descontando el mercado?"
-    start = text.rfind("¿", 0, last_q)
-    if start == -1:
-        start = max(text.rfind("\n", 0, last_q), 0)
-    return text[start : last_q + 1].strip()
-
-
-def _extract_context_headline(text: str) -> str:
-    paragraph = ""
-    for line in text.splitlines():
-        cleaned = line.strip()
-        if not cleaned:
-            if paragraph:
-                break
-            continue
-        if cleaned.lower().startswith("probabilidad"):
-            break
-        if cleaned.lower().startswith("fuente:"):
-            break
-        if cleaned.startswith("#"):
-            continue
-        paragraph = f"{paragraph} {cleaned}".strip()
-
-    paragraph = re.sub(r"#\w+", "", paragraph).strip()
-    if not paragraph:
-        return "Actualización macro"
-
-    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
-    headline = " ".join(sentences[:2]).strip()
-    return headline[:170].rstrip()
-
-
-def create_infographic(
-    image_text: str,
-    output_path: str,
-):
-    width, height = 1200, 675
-    image = Image.new("RGB", (width, height), (18, 18, 18))  # #121212
-    draw = ImageDraw.Draw(image)
-    margin = 90
-    max_width = width - 2 * margin
-    max_height = height - 2 * margin
-
-    highlight = random.choice(
-        [
-            (0, 255, 153),  # #00FF99 (verde neón)
-            (255, 165, 0),  # #FFA500 (naranja)
-            (255, 59, 48),  # #FF3B30 (rojo)
-            (0, 163, 255),  # #00A3FF (azul)
-        ]
-    )
-    base = (255, 255, 255)
-
-    text = " ".join((image_text or "").split()).strip()
-    text = _strip_analysis_prefix(text)
-    if not text:
-        text = "Actualización macro."
-
-    font_size = 58
-    min_font_size = 34
-    line_spacing = 1.25
-
-    while True:
-        font = _load_font(font_size)
-        sample_bbox = draw.textbbox((0, 0), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", font=font)
-        avg_char_width = max(1, (sample_bbox[2] - sample_bbox[0]) // 26)
-        wrap_width = max(18, int(max_width / avg_char_width))
-        while True:
-            lines = textwrap.wrap(
-                text,
-                width=wrap_width,
-                break_long_words=True,
-                break_on_hyphens=False,
-            )
-            widest = 0
-            for line in lines:
-                bbox = draw.textbbox((0, 0), line, font=font)
-                widest = max(widest, bbox[2] - bbox[0])
-            if widest <= max_width or wrap_width <= 18:
-                break
-            wrap_width = max(18, wrap_width - 2)
-        bbox = font.getbbox("Ag")
-        line_height = bbox[3] - bbox[1]
-        total_height = int(len(lines) * line_height * line_spacing)
-
-        if total_height <= max_height or font_size <= min_font_size:
-            break
-        font_size -= 2
-
-    if not lines:
-        lines = [text]
-
-    while True:
-        font = _load_font(font_size)
-        bbox = font.getbbox("Ag")
-        line_height = bbox[3] - bbox[1]
-        total_height = int(len(lines) * line_height * line_spacing)
-        if total_height <= max_height or font_size <= min_font_size:
-            break
-        font_size -= 2
-
-    bbox = font.getbbox("Ag")
-    line_height = bbox[3] - bbox[1]
-    total_height = int(len(lines) * line_height * line_spacing)
-    if total_height > max_height:
-        max_lines = max(1, max_height // max(1, int(line_height * line_spacing)))
-        lines = lines[:max_lines]
-        if lines:
-            last = lines[-1].rstrip()
-            if last and not last.endswith("…"):
-                lines[-1] = (last[:-1].rstrip() + "…") if len(last) > 1 else "…"
-        total_height = int(len(lines) * line_height * line_spacing)
-    start_y = (height - total_height) // 2
-
-    for i, line in enumerate(lines):
-        parts = re.split(_HIGHLIGHT_PATTERN, line)
-        widths = []
-        for part in parts:
-            if part == "":
-                continue
-            bbox = draw.textbbox((0, 0), part, font=font)
-            widths.append(bbox[2] - bbox[0])
-        line_width = sum(widths)
-        start_x = (width - line_width) // 2
-
-        y = start_y + int(i * line_height * line_spacing)
-        _draw_highlighted_line(
-            draw,
-            start_x,
-            y,
-            line,
-            font=font,
-            base_fill=base,
-            highlight_fill=highlight,
-        )
-
-    image.save(output_path, format="PNG")
-
-
-def generate_infographic_image(
-    title: str,
-    post_text: str,
-    output_path: str,
-):
-    macro_analysis = _extract_macro_analysis(post_text)
-    probability = _extract_probability_line(post_text)
-    combined = " ".join((macro_analysis or "").split()).strip()
-    prob = " ".join((probability or "").split()).strip()
-    if prob:
-        combined = f"{combined} {prob}".strip()
-    create_infographic(
-        image_text=combined,
-        output_path=output_path,
-    )
-
-
+# === Orquestación ===
 def build_macro_drafts():
-    """Orquesta el flujo macro y devuelve borradores listos para revision."""
+    """Orquesta el flujo fútbol y devuelve borradores listos para revision."""
     client = OpenAI(
         api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com"
     )
@@ -531,20 +773,26 @@ def build_macro_drafts():
         return []
 
     diverse_news = select_diverse_news(raw_news)
-    print(f"[*] Analizando {len(diverse_news)} eventos de alto impacto.")
+    print(f"[*] Analizando {len(diverse_news)} eventos clave.")
 
     drafts = []
     for item in diverse_news:
         url = item.get("url", "")
-        source_name = url.split("//")[-1].split("/")[0].replace("www.", "")
-
-        post = generate_expert_post(client, item.get("content", ""), source_name)
+        club = (item.get("club") or "").strip()
+        source_name = _extract_domain(url)
+        post = generate_expert_post(
+            client,
+            item.get("title", ""),
+            item.get("content", ""),
+            source_name,
+        )
         if post:
             post = _strip_analysis_prefix(post)
             drafts.append(
                 {
                     "ai_text": post,
-                    "title": _extract_context_headline(post),
+                    "url": url,
+                    "club": club,
                 }
             )
 

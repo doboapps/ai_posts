@@ -51,11 +51,16 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           RUN_TZ: ${{ vars.RUN_TZ }}
           RUN_START_HOUR: ${{ vars.RUN_START_HOUR }}
           RUN_END_HOUR: ${{ vars.RUN_END_HOUR }}
           MAX_DRAFTS: ${{ vars.MAX_DRAFTS }}
           SEND_EMPTY_MESSAGE: ${{ vars.SEND_EMPTY_MESSAGE }}
+          MAX_NEWS_AGE_DAYS: ${{ vars.MAX_NEWS_AGE_DAYS }}
+          ALLOW_UNDATED_NEWS: ${{ vars.ALLOW_UNDATED_NEWS }}
+          ALLOW_STALE_NEWS: ${{ vars.ALLOW_STALE_NEWS }}
+          ONLY_TODAY: ${{ vars.ONLY_TODAY }}
+          RSS_TIMEOUT_SECS: ${{ vars.RSS_TIMEOUT_SECS }}
+          RSS_MAX_ITEMS_PER_FEED: ${{ vars.RSS_MAX_ITEMS_PER_FEED }}
         run: python scheduled_run.py

@@ -1,4 +1,3 @@
-import os
 import re
 import threading
 import time
@@ -10,7 +9,7 @@ import telebot
 from dotenv import load_dotenv
 from telebot import types
 
-from macro_engine import build_macro_drafts, create_infographic, generate_infographic_image
+from macro_engine import build_macro_drafts
 
 load_dotenv()
 
@@ -56,6 +55,68 @@ def _extract_intent_hashtags(text: str, max_count: int = 2) -> tuple[str, list[s
     return cleaned, unique
 
 
+def _append_source_link(text: str, url: str) -> str:
+    cleaned_url = (url or "").strip()
+    base_text = (text or "").strip()
+    if not cleaned_url:
+        return base_text
+    if cleaned_url in base_text:
+        return base_text
+    if not base_text:
+        return cleaned_url
+    lines = base_text.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip().lower().startswith("fuente:"):
+            lines.insert(idx + 1, cleaned_url)
+            return "\n".join(lines).strip()
+    return f"{base_text}\n{cleaned_url}"
+
+
+def _club_prefix(club: str) -> str:
+    normalized = (club or "").strip().lower()
+    if normalized == "real":
+        return "🔵⚪"
+    if normalized == "barca":
+        return "🔴🔵"
+    return ""
+
+
+def _build_post_text(summary_text: str, post_text: str, prefix: str = "") -> str:
+    summary = (summary_text or "").strip()
+    post = (post_text or "").strip()
+    if not post:
+        return summary
+    if not summary:
+        return post
+
+    lines = [line.strip() for line in post.splitlines() if line.strip()]
+    source_lines = [line for line in lines if line.lower().startswith("fuente:")]
+    hashtag_lines = [line for line in lines if line.startswith("#")]
+    question_lines = [
+        line for line in lines if line not in source_lines and line not in hashtag_lines
+    ]
+
+    question_text = " ".join(question_lines).strip() if question_lines else post
+    tail_lines: list[str] = []
+    tail_lines.extend(source_lines)
+    tail_lines.extend(hashtag_lines)
+
+    segments: list[str] = []
+    if question_text:
+        segments.append(question_text)
+    if summary:
+        segments.append(summary)
+    if tail_lines:
+        segments.append("\n".join(tail_lines))
+
+    if prefix and segments:
+        segments[0] = f"{prefix} {segments[0]}".strip()
+    elif prefix:
+        segments = [prefix]
+
+    return "\n\n".join(segment for segment in segments if segment).strip()
+
+
 def _strip_part_labels(text: str) -> str:
     cleaned = (text or "").strip()
     cleaned = re.sub(r"(?im)^\s*parte\s*[12]\s*(?:\([^)]*\))?\s*:\s*", "", cleaned)
@@ -82,33 +143,36 @@ if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is None:
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 pending_posts: Dict[int, str] = {}
-IMAGE_OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "temp_plot.png")
-
 
 def send_drafts(drafts, chat_id):
     for index, draft in enumerate(drafts, start=1):
         if isinstance(draft, dict):
             ai_text = (draft.get("ai_text") or draft.get("tweet_text") or draft.get("draft") or "").strip()
-            title_text = (draft.get("title") or "").strip()
+            source_url = (draft.get("url") or "").strip()
+            club_prefix = _club_prefix(draft.get("club", ""))
         else:
             ai_text = (draft or "").strip()
-            title_text = ""
+            source_url = ""
+            club_prefix = ""
 
         if not ai_text:
             continue
 
-        image_text, post_text = _split_ai_response(ai_text)
-        caption_text = post_text or ai_text
+        summary_text, post_text = _split_ai_response(ai_text)
+        combined_text = _build_post_text(summary_text, post_text, club_prefix)
+        caption_text = _append_source_link(combined_text or ai_text, source_url)
 
-        # En X solo pre-rellenamos el texto del post (Parte 2). El contenido de imagen (Parte 1)
-        # se mantiene exclusivamente dentro de la imagen.
-        full_x_text = (post_text or ai_text).strip()
-        intent_base_text, intent_tags = _extract_intent_hashtags(full_x_text, max_count=2)
+        # En X pre-rellenamos el texto completo del post (resumen + pregunta).
+        full_x_text = caption_text
+        intent_source_text = combined_text or ai_text
+        intent_base_text, intent_tags = _extract_intent_hashtags(intent_source_text, max_count=2)
         intent_text = _normalize_intent_text(intent_base_text)
         intent_url = (
             "https://twitter.com/intent/tweet?text="
             f"{quote(intent_text, safe='', encoding='utf-8')}"
         )
+        if source_url:
+            intent_url += "&url=" + quote(source_url, safe="", encoding="utf-8")
         if intent_tags:
             intent_url += "&hashtags=" + quote(
                 ",".join(intent_tags), safe="", encoding="utf-8"
@@ -121,17 +185,7 @@ def send_drafts(drafts, chat_id):
             types.InlineKeyboardButton("📋 Copiar texto", callback_data="copy"),
             types.InlineKeyboardButton("❌ Descartar", callback_data="discard"),
         )
-        try:
-            if image_text:
-                create_infographic(image_text=image_text, output_path=IMAGE_OUTPUT_PATH)
-            else:
-                generate_infographic_image(title_text, ai_text, IMAGE_OUTPUT_PATH)
-            with open(IMAGE_OUTPUT_PATH, "rb") as photo:
-                message = bot.send_photo(
-                    chat_id, photo, caption=caption_text, reply_markup=keyboard
-                )
-        except Exception:
-            message = bot.send_message(chat_id, caption_text, reply_markup=keyboard)
+        message = bot.send_message(chat_id, caption_text, reply_markup=keyboard)
         pending_posts[message.message_id] = full_x_text
         print(f"[*] Borrador {index} enviado: {full_x_text}")
 

@@ -6,7 +6,6 @@ Bot en Python para generar posts en espanol sobre mercados activos de Polymarket
 
 - Python 3.9+
 - Claves API:
-  - `TAVILY_API_KEY` (búsqueda de noticias)
   - `DEEPSEEK_API_KEY` (texto vía API compatible OpenAI)
   - `TELEGRAM_TOKEN` y `TELEGRAM_CHAT_ID` (si vas a enviar a Telegram)
 
@@ -21,11 +20,25 @@ pip install -r requirements.txt
 Crea un archivo `.env` en la raiz del proyecto:
 
 ```
-TAVILY_API_KEY=tu_clave_tavily
 DEEPSEEK_API_KEY=tu_clave_deepseek
 TELEGRAM_TOKEN=tu_token_telegram
 TELEGRAM_CHAT_ID=tu_chat_id
 ```
+
+Opcional:
+
+```
+MAX_NEWS_AGE_DAYS=3
+ALLOW_UNDATED_NEWS=1
+ALLOW_STALE_NEWS=0
+ONLY_TODAY=1
+RSS_TIMEOUT_SECS=20
+RSS_MAX_ITEMS_PER_FEED=25
+```
+
+## Fuentes RSS
+
+El listado y el orden de prioridad están en `macro_engine.py` dentro de `_RSS_SOURCES`.
 
 ## Uso
 
@@ -40,7 +53,6 @@ Si te basta con ejecutar el bot 1 vez por hora entre las 08:00 y 21:00, puedes u
 1. Sube el proyecto a un repo en GitHub.
 2. En GitHub -> Settings -> Secrets and variables -> Actions:
    - Secrets:
-     - `TAVILY_API_KEY`
      - `DEEPSEEK_API_KEY`
      - `TELEGRAM_TOKEN`
      - `TELEGRAM_CHAT_ID`
@@ -48,8 +60,14 @@ Si te basta con ejecutar el bot 1 vez por hora entre las 08:00 y 21:00, puedes u
      - `RUN_TZ` (ej: `Europe/Madrid`)
      - `RUN_START_HOUR` (default `8`)
      - `RUN_END_HOUR` (default `21`)
-     - `MAX_DRAFTS` (ej: `3`)
+     - `MAX_DRAFTS` (ej: `6`)
      - `SEND_EMPTY_MESSAGE` (`1` para avisar cuando no haya borradores)
+     - `MAX_NEWS_AGE_DAYS` (default `3`)
+     - `ALLOW_UNDATED_NEWS` (`1` para permitir resultados sin fecha, default `1`)
+     - `ALLOW_STALE_NEWS` (`1` para permitir noticias antiguas, default `0`)
+     - `ONLY_TODAY` (`1` para forzar solo noticias del dia, default `0`)
+     - `RSS_TIMEOUT_SECS` (default `20`)
+     - `RSS_MAX_ITEMS_PER_FEED` (default `25`)
 3. El workflow ya está en `.github/workflows/scheduled-posts.yml` y corre cada hora; el script decide si está dentro de la ventana horaria.
 
 Ejecucion local equivalente:

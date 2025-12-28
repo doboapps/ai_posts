@@ -1,5 +1,4 @@
 import os
-import tempfile
 from datetime import datetime
 from typing import Optional, Union
 from urllib.parse import quote
@@ -8,7 +7,7 @@ import telebot
 from dotenv import load_dotenv
 from telebot import types
 
-from macro_engine import build_macro_drafts, create_infographic, generate_infographic_image
+from macro_engine import build_macro_drafts
 
 load_dotenv()
 
@@ -48,6 +47,68 @@ def _extract_intent_hashtags(text: str, max_count: int = 2) -> tuple[str, list[s
     cleaned = re.sub(r"#([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+)", "", text or "")
     cleaned = " ".join(cleaned.split()).strip()
     return cleaned, unique
+
+
+def _append_source_link(text: str, url: str) -> str:
+    cleaned_url = (url or "").strip()
+    base_text = (text or "").strip()
+    if not cleaned_url:
+        return base_text
+    if cleaned_url in base_text:
+        return base_text
+    if not base_text:
+        return cleaned_url
+    lines = base_text.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip().lower().startswith("fuente:"):
+            lines.insert(idx + 1, cleaned_url)
+            return "\n".join(lines).strip()
+    return f"{base_text}\n{cleaned_url}"
+
+
+def _club_prefix(club: str) -> str:
+    normalized = (club or "").strip().lower()
+    if normalized == "real":
+        return "🔵⚪"
+    if normalized == "barca":
+        return "🔴🔵"
+    return ""
+
+
+def _build_post_text(summary_text: str, post_text: str, prefix: str = "") -> str:
+    summary = (summary_text or "").strip()
+    post = (post_text or "").strip()
+    if not post:
+        return summary
+    if not summary:
+        return post
+
+    lines = [line.strip() for line in post.splitlines() if line.strip()]
+    source_lines = [line for line in lines if line.lower().startswith("fuente:")]
+    hashtag_lines = [line for line in lines if line.startswith("#")]
+    question_lines = [
+        line for line in lines if line not in source_lines and line not in hashtag_lines
+    ]
+
+    question_text = " ".join(question_lines).strip() if question_lines else post
+    tail_lines: list[str] = []
+    tail_lines.extend(source_lines)
+    tail_lines.extend(hashtag_lines)
+
+    segments: list[str] = []
+    if question_text:
+        segments.append(question_text)
+    if summary:
+        segments.append(summary)
+    if tail_lines:
+        segments.append("\n".join(tail_lines))
+
+    if prefix and segments:
+        segments[0] = f"{prefix} {segments[0]}".strip()
+    elif prefix:
+        segments = [prefix]
+
+    return "\n\n".join(segment for segment in segments if segment).strip()
 
 
 def _strip_part_labels(text: str) -> str:
@@ -101,41 +162,41 @@ def send_drafts_scheduled(drafts: list[dict], token: str, chat_id: Union[int, st
     bot = telebot.TeleBot(token)
     sent = 0
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        image_path = os.path.join(temp_dir, "infographic.png")
+    for index, draft in enumerate(drafts, start=1):
+        ai_text = (draft.get("ai_text") or draft.get("tweet_text") or draft.get("draft") or "").strip()
+        source_url = (draft.get("url") or "").strip()
 
-        for draft in drafts:
-            ai_text = (draft.get("ai_text") or draft.get("tweet_text") or draft.get("draft") or "").strip()
-            title_text = (draft.get("title") or "").strip()
-            if not ai_text:
-                continue
+        if not ai_text:
+            continue
 
-            image_text, post_text = _split_ai_response(ai_text)
-            caption_text = (post_text or ai_text).strip()
+        summary_text, post_text = _split_ai_response(ai_text)
+        club_prefix = _club_prefix(draft.get("club", ""))
+        combined_text = _build_post_text(summary_text, post_text, club_prefix)
+        separator = "=" * 64
+        print(f"\n{separator}")
+        print(f"[debug] Borrador {index}")
+        print(f"[debug] Resumen (Parte 1): {summary_text}")
+        print(f"[debug] Pregunta (Parte 2): {post_text}")
+        print(f"[debug] Enlace noticia: {source_url or 'URL no disponible'}")
+        caption_text = _append_source_link(combined_text or ai_text, source_url)
+        intent_source_text = combined_text or ai_text
+        intent_base_text, intent_tags = _extract_intent_hashtags(intent_source_text, max_count=2)
+        intent_text = _normalize_intent_text(intent_base_text)
+        intent_url = (
+            "https://twitter.com/intent/tweet?text="
+            f"{quote(intent_text, safe='', encoding='utf-8')}"
+        )
+        if source_url:
+            intent_url += "&url=" + quote(source_url, safe="", encoding="utf-8")
+        if intent_tags:
+            intent_url += "&hashtags=" + quote(",".join(intent_tags), safe="", encoding="utf-8")
 
-            intent_base_text, intent_tags = _extract_intent_hashtags(caption_text, max_count=2)
-            intent_text = _normalize_intent_text(intent_base_text)
-            intent_url = (
-                "https://twitter.com/intent/tweet?text="
-                f"{quote(intent_text, safe='', encoding='utf-8')}"
-            )
-            if intent_tags:
-                intent_url += "&hashtags=" + quote(",".join(intent_tags), safe="", encoding="utf-8")
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.row(types.InlineKeyboardButton("🚀 Abrir en X", url=intent_url))
 
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.row(types.InlineKeyboardButton("🚀 Abrir en X", url=intent_url))
+        bot.send_message(chat_id, caption_text, reply_markup=keyboard)
 
-            try:
-                if image_text:
-                    create_infographic(image_text=image_text, output_path=image_path)
-                else:
-                    generate_infographic_image(title_text, ai_text, image_path)
-                with open(image_path, "rb") as photo:
-                    bot.send_photo(chat_id, photo, caption=caption_text, reply_markup=keyboard)
-            except Exception:
-                bot.send_message(chat_id, caption_text, reply_markup=keyboard)
-
-            sent += 1
+        sent += 1
 
     return sent
 
@@ -147,7 +208,6 @@ def main() -> int:
         return 0
 
     try:
-        _require_env("TAVILY_API_KEY")
         _require_env("DEEPSEEK_API_KEY")
         token = _require_env("TELEGRAM_TOKEN")
         chat_id = _get_chat_id(_require_env("TELEGRAM_CHAT_ID"))
