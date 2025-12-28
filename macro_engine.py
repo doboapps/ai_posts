@@ -22,6 +22,7 @@ HIGHLIGHT_COLORS = [
     (255, 59, 48),  # #FF3B30 (rojo)
     (0, 163, 255),  # #00A3FF (azul)
 ]
+DEFAULT_MAX_DRAFTS = 5
 
 # === Búsqueda y filtrado de noticias ===
 def get_hot_macro_news():
@@ -89,7 +90,11 @@ _PRIORITY_SOURCES = [
     "sport.es",
     "mundodeportivo.com",
     "eldesmarque.com",
+    "okdiario.com/deportes",
+    "goal.com/es",
+    "theathletic.com/spain",
 ]
+_ALLOWED_SOURCES = list(_PRIORITY_SOURCES)
 
 
 def _extract_domain(url: str) -> str:
@@ -105,12 +110,28 @@ def _domain_matches(domain: str, priority: str) -> bool:
     return domain == priority or domain.endswith(f".{priority}")
 
 
+def _get_max_drafts() -> int:
+    raw = (os.getenv("MAX_DRAFTS") or "").strip()
+    if raw.isdigit():
+        value = int(raw)
+        if value > 0:
+            return value
+    return DEFAULT_MAX_DRAFTS
+
+
 def _priority_rank(item: dict) -> int:
     domain = _extract_domain(item.get("url", ""))
     for idx, priority in enumerate(_PRIORITY_SOURCES):
         if _domain_matches(domain, priority):
             return idx
     return len(_PRIORITY_SOURCES) + 1
+
+
+def _is_allowed_source(item: dict) -> bool:
+    domain = _extract_domain(item.get("url", ""))
+    if not domain:
+        return False
+    return any(_domain_matches(domain, allowed) for allowed in _ALLOWED_SOURCES)
 
 
 def _prioritize_news_results(news_results: list[dict]) -> list[dict]:
@@ -150,11 +171,16 @@ def _classify_topic(text: str) -> str:
 def select_diverse_news(news_results):
     final_selection = []
     temas_vistos = set()
+    repeated_candidates = []
+    max_drafts = _get_max_drafts()
 
     # Priorizamos fuentes clave y mezclamos dentro de cada grupo
     news_results = _prioritize_news_results(news_results)
 
     for item in news_results:
+        if not _is_allowed_source(item):
+            continue
+
         title = item.get("title", "")
         content = item.get("content", "")
         text = f"{title} {content}".lower()
@@ -163,22 +189,25 @@ def select_diverse_news(news_results):
         if not _mentions_target_clubs(text):
             continue
 
-        # 2. Filtro de Datos: Priorizamos noticias con movimiento numérico
-        has_numbers = any(char.isdigit() for char in text)
-        if not has_numbers:
-            continue
-
-        # 3. Clasificación para diversidad de temas futbolísticos
+        # 2. Clasificación para diversidad de temas futbolísticos
         tema = _classify_topic(text)
 
-        # 3. Solo añadimos si el tema no está repetido en este ciclo
+        # 3. Priorizamos temas distintos, pero guardamos repetidos como fallback
         if tema not in temas_vistos:
             final_selection.append(item)
             temas_vistos.add(tema)
+        else:
+            repeated_candidates.append(item)
 
-        # Límite de 3 noticias por hora para no saturar
-        if len(final_selection) >= 3:
+        # Límite configurable de noticias para no saturar
+        if len(final_selection) >= max_drafts:
             break
+
+    if len(final_selection) < max_drafts:
+        for item in repeated_candidates:
+            final_selection.append(item)
+            if len(final_selection) >= max_drafts:
+                break
 
     return final_selection
 
