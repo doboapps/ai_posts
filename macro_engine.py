@@ -514,7 +514,8 @@ def _club_label_from_set(clubs: set[str]) -> Optional[str]:
 
 def select_diverse_news(news_results):
     max_drafts = _get_max_drafts()
-    if not news_results:
+    max_drafts -= max_drafts % 2
+    if max_drafts < 2 or not news_results:
         return []
 
     only_today = _only_today()
@@ -533,8 +534,10 @@ def select_diverse_news(news_results):
 
         title = (item.get("title") or "").strip()
         url = (item.get("url") or "").strip()
+        content = (item.get("content") or "").strip()
         title_url_text = f"{title} {url}".strip().lower()
-        clubs = _detect_clubs(title_url_text)
+        detection_text = f"{title} {url} {content}".strip().lower()
+        clubs = _detect_clubs(detection_text)
         if not clubs:
             continue
         if _is_blocked_url(url):
@@ -574,14 +577,6 @@ def select_diverse_news(news_results):
             candidate["priority"],
         )
     )
-
-    if max_drafts < 2 or max_drafts % 2 != 0:
-        selected_items: list[dict] = []
-        for candidate in candidates[:max_drafts]:
-            item = candidate["item"]
-            item["club"] = _club_label_from_set(candidate["clubs"])
-            selected_items.append(item)
-        return selected_items
 
     target_per_club = max_drafts // 2
     real_count = 0
@@ -630,19 +625,30 @@ def select_diverse_news(news_results):
         if real_count >= target_per_club and barca_count >= target_per_club:
             break
 
-    if len(selected) < max_drafts:
-        for candidate in candidates:
-            if len(selected) >= max_drafts:
-                break
-            key = candidate["key"]
-            if key in selected_keys:
-                continue
-            if not candidate["item"].get("club"):
-                candidate["item"]["club"] = _club_label_from_set(candidate["clubs"])
-            selected.append(candidate)
-            selected_keys.add(key)
+    balanced_target = min(real_count, barca_count)
+    if balanced_target == 0:
+        return []
 
-    return [candidate["item"] for candidate in selected[:max_drafts]]
+    balanced_selected: list[dict] = []
+    real_count = 0
+    barca_count = 0
+    for candidate in selected:
+        club = candidate["item"].get("club")
+        if club == "real":
+            if real_count >= balanced_target:
+                continue
+            real_count += 1
+        elif club == "barca":
+            if barca_count >= balanced_target:
+                continue
+            barca_count += 1
+        else:
+            continue
+        balanced_selected.append(candidate)
+        if real_count >= balanced_target and barca_count >= balanced_target:
+            break
+
+    return [candidate["item"] for candidate in balanced_selected]
 
 
 # === Generación de contenido ===
