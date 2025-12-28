@@ -96,12 +96,12 @@ _BAD_QUESTION_STARTS = (
 )
 
 _RSS_SOURCES = [
-    {"name": "Marca", "url": "https://e00-xlk-ue-marca.uecdn.es/rss/futbol.xml"},
+    {"name": "Marca", "url": "https://objetos.estaticos-marca.com/rss/futbol/real-madrid.xml"},
     {"name": "Sport", "url": "https://www.sport.es/es/rss/barca/rss.xml"},
-    {"name": "AS", "url": "https://feeds.as.com/mrss-s/pages/as/site/as.com/section/futbol/portada/"},
+    {"name": "AS", "url": "https://feeds.as.com/mrss-s/list/as/site/as.com/tag/real_madrid_a/"},
+    {"name": "Mundo Deportivo", "url": "https://www.mundodeportivo.com/feed/rss/futbol"},
     {"name": "El Periodico", "url": "https://www.elperiodico.com/es/rss/barca/rss.xml"},
     {"name": "El Pais", "url": "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/deportes/portada"},
-    {"name": "Mundo Deportivo", "url": "https://www.mundodeportivo.com/feed/rss/portada"},
 ]
 
 # === Búsqueda y filtrado de noticias ===
@@ -682,8 +682,8 @@ PARTE 1 (RESUMEN):
 
 PARTE 2 (PREGUNTA + FUENTE + HASHTAGS):
 - Genera una PREGUNTA CORTA (máximo 85 caracteres), 1 línea.
-- Tono: incisivo y directo, sin humor forzado pero con algo sarcasmo.
-- Debe ser concreta y polémica: plantea una contradicción o doble rasero del hecho.
+- Tono: directo pero fácil de entender, sin humor forzado pero con sarcasmo.
+- Debe ser concreta y polémica: debe joder al aficcionado que lo lea.
 - Incluye al menos 1 elemento literal de NOTICIA (nombre propio, club o competición).
 - NO preguntes datos obvios (ej: "¿Quién ganó?"). Cuestiona el "cómo" o el "por qué".
 - EVITA muletillas genéricas como: "¿Hasta cuándo?", "¿Tan difícil?", "¿De verdad?".
@@ -694,11 +694,10 @@ PARTE 2 (PREGUNTA + FUENTE + HASHTAGS):
 
 REGLAS GENERALES:
 1. IDIOMA: Español de España (coloquial futbolero).
-2. SIN ICONOS NI EMOJIS.
-3. ENFOQUE: Solo Real Madrid o FC Barcelona.
-4. RIGOR: Usa solo información explícita de NOTICIA. No inventes contexto (tabla, entrenador, resultados, fichajes, lesiones o premios).
-5. NOMBRES: No menciones personas o equipos que no aparezcan en NOTICIA.
-6. SI HAY POCA INFORMACIÓN: Haz una pregunta general sin afirmar hechos externos.
+2. ENFOQUE: Solo Real Madrid o FC Barcelona.
+3. RIGOR: Usa solo información explícita de NOTICIA. No inventes contexto (tabla, entrenador, resultados, fichajes, lesiones o premios).
+4. NOMBRES: No menciones personas o equipos que no aparezcan en NOTICIA.
+5. SI HAY POCA INFORMACIÓN: Haz una pregunta general sin afirmar hechos externos.
 """
     keywords = _extract_keywords(title) or _extract_keywords(content)
     keyword_hint = ", ".join(keywords[:5])
