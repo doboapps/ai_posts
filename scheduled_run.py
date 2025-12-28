@@ -104,13 +104,21 @@ def send_drafts_scheduled(drafts: list[dict], token: str, chat_id: Union[int, st
     with tempfile.TemporaryDirectory() as temp_dir:
         image_path = os.path.join(temp_dir, "infographic.png")
 
-        for draft in drafts:
+        for index, draft in enumerate(drafts, start=1):
             ai_text = (draft.get("ai_text") or draft.get("tweet_text") or draft.get("draft") or "").strip()
             title_text = (draft.get("title") or "").strip()
+            source_url = (draft.get("url") or "").strip()
+
             if not ai_text:
                 continue
 
             image_text, post_text = _split_ai_response(ai_text)
+            separator = "=" * 64
+            print(f"\n{separator}")
+            print(f"[debug] Borrador {index}")
+            print(f"[debug] Texto imagen (Parte 1): {image_text}")
+            print(f"[debug] Texto post (Parte 2): {post_text}")
+            print(f"[debug] Enlace noticia: {source_url or 'URL no disponible'}")
             caption_text = (post_text or ai_text).strip()
 
             intent_base_text, intent_tags = _extract_intent_hashtags(caption_text, max_count=2)

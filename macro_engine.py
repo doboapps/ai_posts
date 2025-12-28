@@ -3,7 +3,7 @@ import random
 import re
 import textwrap
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 import requests
@@ -13,25 +13,32 @@ from openai import OpenAI
 
 load_dotenv()
 
+# === Configuración y constantes ===
+DEFAULT_FALLBACK_TEXT = "Actualización fútbol."
+HEADLINE_FALLBACK = "Actualización fútbol"
+HIGHLIGHT_COLORS = [
+    (0, 255, 153),  # #00FF99 (verde neón)
+    (255, 165, 0),  # #FFA500 (naranja)
+    (255, 59, 48),  # #FF3B30 (rojo)
+    (0, 163, 255),  # #00A3FF (azul)
+]
+
+# === Búsqueda y filtrado de noticias ===
 def get_hot_macro_news():
     api_key = os.getenv("TAVILY_API_KEY")
     now = datetime.now()
 
-    # Lógica de ventana: Si estamos a final de mes/trimestre, miramos al frente
-    # Si quedan menos de 10 días para el mes siguiente, pivotamos la búsqueda
-    if (now + timedelta(days=10)).month != now.month:
-        proximo_mes = (now + timedelta(days=10)).strftime("%B")
-        anio_objetivo = (now + timedelta(days=10)).year
-        contexto_temporal = f"expectations and early signals for {proximo_mes} {anio_objetivo}"
+    if now.weekday() >= 4:
+        contexto_temporal = "previas y claves de los próximos partidos del fin de semana"
     else:
-        contexto_temporal = f"current market drivers and volatility for {now.strftime('%B %Y')}"
+        contexto_temporal = "lecturas del último partido y actualizaciones clave de la semana"
 
-    # Buscamos por "catalizadores" y "sorpresas", no por etiquetas fijas
     query = (
         f"{contexto_temporal}, "
-        "institutional rebalancing and dark pool activity, "
-        "breaking financial news with immediate price impact, "
-        "unusual options flow and market sentiment shifts"
+        "Real Madrid OR FC Barcelona OR Barça OR Barca, "
+        "lesiones confirmadas, sanciones, alineaciones probables, "
+        "fichajes y mercado, tácticas, estadísticas clave, "
+        "resultados y marcador en LaLiga, Champions League, Copa del Rey"
     )
 
     payload = {
@@ -44,44 +51,125 @@ def get_hot_macro_news():
     }
 
     try:
-        print(f"[*] Escaneando ventana de impacto: {contexto_temporal}...")
+        print(f"[*] Escaneando actualidad fútbol: {contexto_temporal}...")
         r = requests.post("https://api.tavily.com/search", json=payload, timeout=30)
         return r.json().get("results", [])
     except Exception as e:
         print(f"[!] Error: {e}")
         return []
 
+_REAL_TOKENS = [
+    "real madrid",
+    "realmadrid",
+    "real-madrid",
+    "bernabeu",
+    "bernabéu",
+    "santiago bernabéu",
+    "los blancos",
+    "merengue",
+]
+
+_BARCA_TOKENS = [
+    "fc barcelona",
+    "barcelona",
+    "barça",
+    "barca",
+    "fcb",
+    "blaugrana",
+    "culé",
+    "camp nou",
+    "nou camp",
+]
+
+_CLUB_TOKENS = _REAL_TOKENS + _BARCA_TOKENS
+
+_PRIORITY_SOURCES = [
+    "as.com",
+    "marca.com",
+    "sport.es",
+    "mundodeportivo.com",
+    "eldesmarque.com",
+]
+
+
+def _extract_domain(url: str) -> str:
+    if not url:
+        return ""
+    domain = url.split("//")[-1].split("/")[0].lower()
+    return domain.replace("www.", "")
+
+
+def _domain_matches(domain: str, priority: str) -> bool:
+    if not domain or not priority:
+        return False
+    return domain == priority or domain.endswith(f".{priority}")
+
+
+def _priority_rank(item: dict) -> int:
+    domain = _extract_domain(item.get("url", ""))
+    for idx, priority in enumerate(_PRIORITY_SOURCES):
+        if _domain_matches(domain, priority):
+            return idx
+    return len(_PRIORITY_SOURCES) + 1
+
+
+def _prioritize_news_results(news_results: list[dict]) -> list[dict]:
+    buckets: dict[int, list[dict]] = {}
+    for item in news_results:
+        rank = _priority_rank(item)
+        buckets.setdefault(rank, []).append(item)
+    ordered: list[dict] = []
+    for rank in sorted(buckets):
+        bucket = buckets[rank]
+        random.shuffle(bucket)
+        ordered.extend(bucket)
+    return ordered
+
+
+def _mentions_target_clubs(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in _CLUB_TOKENS)
+
+
+def _classify_topic(text: str) -> str:
+    if any(x in text for x in ["clásico", "clasico", "barça vs real", "barca vs real"]):
+        return "clasico"
+    if any(x in text for x in ["fichaje", "traspaso", "mercado", "cláusula", "clausula"]):
+        return "mercado"
+    if any(x in text for x in ["lesión", "lesion", "lesiones", "injury", "sanción", "sancion", "baja"]):
+        return "lesiones"
+    if any(x in text for x in ["alineación", "alineacion", "once", "xi", "táctica", "tactica"]):
+        return "tactica"
+    if any(x in text for x in ["champions", "europa league", "liga de campeones", "ucl"]):
+        return "champions"
+    if any(x in text for x in ["laliga", "liga", "copa del rey", "supercopa"]):
+        return "competicion"
+    return "partido"
+
+
 def select_diverse_news(news_results):
     final_selection = []
     temas_vistos = set()
 
-    # Mezclamos un poco para no coger siempre lo mismo si hay muchos resultados
-    random.shuffle(news_results)
+    # Priorizamos fuentes clave y mezclamos dentro de cada grupo
+    news_results = _prioritize_news_results(news_results)
 
     for item in news_results:
         title = item.get("title", "")
         content = item.get("content", "")
-        text = (title + " " + content).lower()
+        text = f"{title} {content}".lower()
 
-        # 1. Filtro de Datos: Priorizamos noticias con movimiento numérico
+        # 1. Solo queremos noticias de Real Madrid o FC Barcelona
+        if not _mentions_target_clubs(text):
+            continue
+
+        # 2. Filtro de Datos: Priorizamos noticias con movimiento numérico
         has_numbers = any(char.isdigit() for char in text)
         if not has_numbers:
             continue
 
-        # 2. Nueva lógica de categorización más amplia
-        if any(x in text for x in ["gold", "oro", "silver", "plata"]):
-            tema = "metales"
-        elif any(x in text for x in ["gdp", "pib", "growth", "crecimiento"]):
-            tema = "crecimiento"
-        elif any(x in text for x in ["fed", "ecb", "bce", "rates", "tipos", "powell", "lagarde"]):
-            tema = "bancos_centrales"
-        elif any(x in text for x in ["altman", "musk", "saylor", "burry", "buffett", "nvidia", "apple", "tesla", "openai"]):
-            # Capturamos a los "Market Movers" que mencionabas
-            tema = "market_movers"
-        elif any(x in text for x in ["ai", "ia", "tech", "tecnología", "breakthrough", "disrupción"]):
-            tema = "disrupcion_tech"
-        else:
-            tema = "otros_impacto"
+        # 3. Clasificación para diversidad de temas futbolísticos
+        tema = _classify_topic(text)
 
         # 3. Solo añadimos si el tema no está repetido en este ciclo
         if tema not in temas_vistos:
@@ -94,6 +182,8 @@ def select_diverse_news(news_results):
 
     return final_selection
 
+
+# === Generación de contenido ===
 def generate_expert_post(client: OpenAI, news_content: str, source_name: str):
     suggested_handle = _guess_source_handle(source_name) or source_name
     prompt = f"""
@@ -104,26 +194,27 @@ HANDLE_SUGERIDO: {suggested_handle}
 TAREA: Devuelve una respuesta dividida en 2 partes usando EXACTAMENTE el separador ###.
 
 PARTE 1 (IMAGEN):
-- Análisis macro corto + dato(s) numéricos + Probabilidad específica.
+- Análisis futbolístico corto sobre Real Madrid o FC Barcelona + dato(s) numéricos + Probabilidad específica.
 - NO incluyas hashtags ni fuentes aquí.
 
 ###
 
 PARTE 2 (POST PARA X):
-- Una PREGUNTA que se entienda sola, incluyendo el contexto y la cifra clave (ej: "¿Es realista que el Bitcoin alcance los 150K tras este último movimiento de Saylor?").
+- Una PREGUNTA (una linea) que se entienda sola, incluyendo el contexto y la cifra clave (ej: "¿Le alcanza al Real Madrid con este 2-1 y 14 remates para dominar la eliminatoria?").
 - 1 línea con la fuente: "Fuente: {suggested_handle}".
 - 1 línea con 1 o 2 hashtags (trending).
 
 REGLAS:
 1. IDIOMA: Español de España.
-2. AUTONOMÍA: El post debe entenderse sin mirar la imagen. Prohibido usar "esta noticia" o "¿llegará a ese precio?". Nombra el precio y el activo.
-3. ESTILO: Analista senior, directo y provocador.
+2. AUTONOMÍA: El post debe entenderse sin mirar la imagen y viceverssa. Prohibido usar "esta noticia". Nombra el marcador, el rival o el torneo.
+3. ENFOQUE: Solo Real Madrid o FC Barcelona.
+4. ESTILO: Analista senior, directo, algo provocador, sarcasmo y algo de humor.
 """
     try:
         resp = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": "Generas contenido financiero de alto impacto para X. Tus posts deben ser autosuficientes y generar debate inmediato."},
+                {"role": "system", "content": "Generas contenido futbolístico masculino de alto impacto para X, centrado exclusivamente en Real Madrid y FC Barcelona. Tus posts deben ser autosuficientes y generar debate inmediato."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
@@ -132,46 +223,9 @@ REGLAS:
     except Exception:
         return None
 
-def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    font_paths = [
-        "/System/Library/Fonts/SFNS.ttf",
-        "/System/Library/Fonts/SFNSDisplay.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/Library/Fonts/Arial.ttf",
-        "/Library/Fonts/Helvetica.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
-    for path in font_paths:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size=size)
-            except OSError:
-                continue
-    return ImageFont.load_default()
-
-
-def _wrap_text(text: str, draw: ImageDraw.ImageDraw, font: ImageFont.ImageFont, max_width: int):
-    words = text.split()
-    if not words:
-        return [""]
-
-    lines = []
-    current = words[0]
-    for word in words[1:]:
-        test_line = f"{current} {word}"
-        width = draw.textbbox((0, 0), test_line, font=font)[2]
-        if width <= max_width:
-            current = test_line
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-    return lines
+# === Utilidades de texto ===
+def _normalize_spaces(text: str) -> str:
+    return " ".join((text or "").split()).strip()
 
 
 def _extract_probability_line(text: str) -> str:
@@ -182,22 +236,6 @@ def _extract_probability_line(text: str) -> str:
     if match:
         return match.group(1).strip()
     return "Probabilidad: N/D"
-
-
-def _extract_hashtags(text: str, max_count: int = 2) -> list[str]:
-    tags = re.findall(r"#([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+)", text)
-    unique: list[str] = []
-    seen = set()
-    for tag in tags:
-        normalized = f"#{tag}"
-        key = normalized.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(normalized)
-        if len(unique) >= max_count:
-            break
-    return unique
 
 
 def _strip_analysis_prefix(text: str) -> str:
@@ -219,19 +257,6 @@ def _guess_source_handle(source_name: str) -> Optional[str]:
             return None
         handle = f"@{base}"
     return handle[:30]
-
-def _compose_short_post(summary: str, source: str, hashtags: list[str]) -> str:
-    parts: list[str] = []
-    summary = " ".join((summary or "").split()).strip()
-    if summary:
-        parts.append(summary)
-    source = (source or "").strip()
-    if source:
-        parts.append(f". Fuente: {source}")
-    tags = [t for t in (hashtags or []) if t]
-    if tags:
-        parts.append(" ".join(tags[:2]))
-    return "\n".join(parts).strip()
 
 
 def _extract_macro_analysis(text: str) -> str:
@@ -268,23 +293,56 @@ def _extract_macro_analysis(text: str) -> str:
     paragraph = " ".join(lines).strip()
     paragraph = _strip_analysis_prefix(paragraph)
     paragraph = re.sub(r"\s{2,}", " ", paragraph)
-    return paragraph or "Actualización macro."
+    return paragraph or DEFAULT_FALLBACK_TEXT
 
 
-def _extract_very_brief_summary(macro_analysis: str, max_chars: int = 120) -> str:
-    text = " ".join((macro_analysis or "").split()).strip()
-    if not text:
-        return "Actualización macro."
+def _extract_context_headline(text: str) -> str:
+    paragraph = ""
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            if paragraph:
+                break
+            continue
+        if cleaned.lower().startswith("probabilidad"):
+            break
+        if cleaned.lower().startswith("fuente:"):
+            break
+        if cleaned.startswith("#"):
+            continue
+        paragraph = f"{paragraph} {cleaned}".strip()
 
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    candidate = (sentences[0] or "").strip() if sentences else text
-    if not candidate:
-        candidate = text
+    paragraph = re.sub(r"#\w+", "", paragraph).strip()
+    if not paragraph:
+        return HEADLINE_FALLBACK
 
-    if len(candidate) <= max_chars:
-        return candidate
-    truncated = candidate[: max_chars - 1].rstrip()
-    return truncated + "…"
+    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+    headline = " ".join(sentences[:2]).strip()
+    return headline[:170].rstrip()
+
+
+# === Render de imagen ===
+def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    font_paths = [
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/SFNSDisplay.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+        "/Library/Fonts/Helvetica.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
 
 
 _HIGHLIGHT_PATTERN = re.compile(r"(\S*(?:\d|[$%])\S*)")
@@ -311,91 +369,6 @@ def _draw_highlighted_line(
         cursor_x += bbox[2] - bbox[0]
 
 
-def _extract_summary_word(text: str, fallback: str = "") -> str:
-    fallback = (fallback or "").strip()
-    if fallback and len(fallback.split()) == 1:
-        return re.sub(r"^[@#]+", "", fallback).upper()
-
-    hashtags = re.findall(r"#([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+)", text)
-    if hashtags:
-        return hashtags[0].upper()
-
-    lowered = text.lower()
-    topic_map = [
-        ("fed", "FED"),
-        ("powell", "FED"),
-        ("bce", "BCE"),
-        ("ecb", "BCE"),
-        ("pib", "PIB"),
-        ("gdp", "PIB"),
-        ("inflación", "INFLACIÓN"),
-        ("inflation", "INFLACIÓN"),
-        ("tipos", "TIPOS"),
-        ("rates", "TIPOS"),
-        ("oro", "ORO"),
-        ("gold", "ORO"),
-        ("plata", "PLATA"),
-        ("silver", "PLATA"),
-        ("arancel", "ARANCELES"),
-        ("tariff", "ARANCELES"),
-        ("recesión", "RECESIÓN"),
-        ("recession", "RECESIÓN"),
-    ]
-    for needle, label in topic_map:
-        if needle in lowered:
-            return label
-
-    return "MACRO"
-
-
-def _extract_question_text(text: str) -> str:
-    candidates = []
-    for line in text.splitlines():
-        cleaned = line.strip()
-        if not cleaned:
-            continue
-        if cleaned.lower().startswith("fuente:"):
-            continue
-        if "?" in cleaned or "¿" in cleaned:
-            candidates.append(cleaned)
-
-    if candidates:
-        return candidates[-1]
-
-    last_q = text.rfind("?")
-    if last_q == -1:
-        return "¿Cómo lo está descontando el mercado?"
-    start = text.rfind("¿", 0, last_q)
-    if start == -1:
-        start = max(text.rfind("\n", 0, last_q), 0)
-    return text[start : last_q + 1].strip()
-
-
-def _extract_context_headline(text: str) -> str:
-    paragraph = ""
-    for line in text.splitlines():
-        cleaned = line.strip()
-        if not cleaned:
-            if paragraph:
-                break
-            continue
-        if cleaned.lower().startswith("probabilidad"):
-            break
-        if cleaned.lower().startswith("fuente:"):
-            break
-        if cleaned.startswith("#"):
-            continue
-        paragraph = f"{paragraph} {cleaned}".strip()
-
-    paragraph = re.sub(r"#\w+", "", paragraph).strip()
-    if not paragraph:
-        return "Actualización macro"
-
-    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
-    headline = " ".join(sentences[:2]).strip()
-    return headline[:170].rstrip()
-
-
 def create_infographic(
     image_text: str,
     output_path: str,
@@ -407,20 +380,13 @@ def create_infographic(
     max_width = width - 2 * margin
     max_height = height - 2 * margin
 
-    highlight = random.choice(
-        [
-            (0, 255, 153),  # #00FF99 (verde neón)
-            (255, 165, 0),  # #FFA500 (naranja)
-            (255, 59, 48),  # #FF3B30 (rojo)
-            (0, 163, 255),  # #00A3FF (azul)
-        ]
-    )
+    highlight = random.choice(HIGHLIGHT_COLORS)
     base = (255, 255, 255)
 
-    text = " ".join((image_text or "").split()).strip()
+    text = _normalize_spaces(image_text)
     text = _strip_analysis_prefix(text)
     if not text:
-        text = "Actualización macro."
+        text = DEFAULT_FALLBACK_TEXT
 
     font_size = 58
     min_font_size = 34
@@ -510,8 +476,8 @@ def generate_infographic_image(
 ):
     macro_analysis = _extract_macro_analysis(post_text)
     probability = _extract_probability_line(post_text)
-    combined = " ".join((macro_analysis or "").split()).strip()
-    prob = " ".join((probability or "").split()).strip()
+    combined = _normalize_spaces(macro_analysis)
+    prob = _normalize_spaces(probability)
     if prob:
         combined = f"{combined} {prob}".strip()
     create_infographic(
@@ -520,8 +486,9 @@ def generate_infographic_image(
     )
 
 
+# === Orquestación ===
 def build_macro_drafts():
-    """Orquesta el flujo macro y devuelve borradores listos para revision."""
+    """Orquesta el flujo fútbol y devuelve borradores listos para revision."""
     client = OpenAI(
         api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com"
     )
@@ -531,13 +498,12 @@ def build_macro_drafts():
         return []
 
     diverse_news = select_diverse_news(raw_news)
-    print(f"[*] Analizando {len(diverse_news)} eventos de alto impacto.")
+    print(f"[*] Analizando {len(diverse_news)} eventos clave.")
 
     drafts = []
     for item in diverse_news:
         url = item.get("url", "")
-        source_name = url.split("//")[-1].split("/")[0].replace("www.", "")
-
+        source_name = _extract_domain(url)
         post = generate_expert_post(client, item.get("content", ""), source_name)
         if post:
             post = _strip_analysis_prefix(post)
@@ -545,6 +511,7 @@ def build_macro_drafts():
                 {
                     "ai_text": post,
                     "title": _extract_context_headline(post),
+                    "url": url,
                 }
             )
 
