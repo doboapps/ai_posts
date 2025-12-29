@@ -18,7 +18,9 @@ except ImportError:  # pragma: no cover (py<3.9)
 load_dotenv()
 
 # === Configuración y constantes ===
-DEFAULT_MAX_DRAFTS = 5
+DEFAULT_MAX_DRAFTS = 12
+DEFAULT_REAL_SHARE = 3
+DEFAULT_BARCA_SHARE = 1
 DEFAULT_RSS_TIMEOUT = 20
 DEFAULT_RSS_MAX_ITEMS_PER_FEED = 25
 DEFAULT_RSS_CONTENT_LIMIT = 1200
@@ -26,6 +28,8 @@ DEFAULT_MAX_AGE_DAYS = 3.0
 DEFAULT_ALLOW_UNDATED_NEWS = True
 DEFAULT_ALLOW_STALE_NEWS = False
 DEFAULT_ONLY_TODAY = False
+DEFAULT_SUMMARY_MAX_CHARS = 140
+DEFAULT_QUESTION_MAX_CHARS = 80
 
 _NON_FOOTBALL_HINTS = [
     "baloncesto",
@@ -186,13 +190,60 @@ def _pick_entry_url(entry: dict) -> str:
     return candidates[0] if candidates else ""
 
 
-def _get_max_drafts() -> int:
-    raw = (os.getenv("MAX_DRAFTS") or "").strip()
+def _get_env_int(name: str) -> Optional[int]:
+    raw = (os.getenv(name) or "").strip()
     if raw.isdigit():
-        value = int(raw)
-        if value > 0:
-            return value
+        return int(raw)
+    return None
+
+
+def _get_summary_max_chars() -> int:
+    value = _get_env_int("SUMMARY_MAX_CHARS")
+    if value and value > 0:
+        return value
+    return DEFAULT_SUMMARY_MAX_CHARS
+
+
+def _get_question_max_chars() -> int:
+    value = _get_env_int("QUESTION_MAX_CHARS")
+    if value and value > 0:
+        return value
+    value = _get_env_int("TWEET_MAX_CHARS")
+    if value and value > 0:
+        return value
+    return DEFAULT_QUESTION_MAX_CHARS
+
+
+def _get_max_drafts() -> int:
+    value = _get_env_int("MAX_DRAFTS")
+    if value and value > 0:
+        return value
     return DEFAULT_MAX_DRAFTS
+
+
+def _get_club_targets(max_drafts: int) -> tuple[int, int]:
+    real_value = _get_env_int("REAL_DRAFTS")
+    barca_value = _get_env_int("BARCA_DRAFTS")
+
+    if real_value is not None and barca_value is not None:
+        return real_value, barca_value
+    if real_value is not None:
+        if max_drafts > 0:
+            return real_value, max(max_drafts - real_value, 0)
+        return real_value, 0
+    if barca_value is not None:
+        if max_drafts > 0:
+            return max(max_drafts - barca_value, 0), barca_value
+        return 0, barca_value
+
+    if max_drafts <= 0:
+        return 0, 0
+    share_total = DEFAULT_REAL_SHARE + DEFAULT_BARCA_SHARE
+    if share_total <= 0:
+        return 0, 0
+    real_target = int(max_drafts * DEFAULT_REAL_SHARE / share_total)
+    barca_target = max_drafts - real_target
+    return real_target, barca_target
 
 
 def _get_rss_timeout() -> int:
@@ -514,8 +565,11 @@ def _club_label_from_set(clubs: set[str]) -> Optional[str]:
 
 def select_diverse_news(news_results):
     max_drafts = _get_max_drafts()
-    max_drafts -= max_drafts % 2
-    if max_drafts < 2 or not news_results:
+    if max_drafts < 1 or not news_results:
+        return []
+    target_real, target_barca = _get_club_targets(max_drafts)
+    total_target = target_real + target_barca
+    if total_target < 1:
         return []
 
     only_today = _only_today()
@@ -578,14 +632,13 @@ def select_diverse_news(news_results):
         )
     )
 
-    target_per_club = max_drafts // 2
     real_count = 0
     barca_count = 0
     selected: list[dict] = []
     selected_keys: set[str] = set()
 
     for candidate in candidates:
-        if len(selected) >= max_drafts:
+        if len(selected) >= total_target:
             break
         clubs = candidate["clubs"]
         if not clubs:
@@ -593,22 +646,25 @@ def select_diverse_news(news_results):
 
         assigned_club: Optional[str] = None
         if clubs == {"real"}:
-            if real_count < target_per_club:
+            if real_count < target_real:
                 assigned_club = "real"
         elif clubs == {"barca"}:
-            if barca_count < target_per_club:
+            if barca_count < target_barca:
                 assigned_club = "barca"
         else:
-            if real_count < target_per_club or barca_count < target_per_club:
-                if real_count < target_per_club and barca_count < target_per_club:
-                    if (target_per_club - real_count) >= (target_per_club - barca_count):
+            remaining_real = target_real - real_count
+            remaining_barca = target_barca - barca_count
+            if remaining_real > 0 or remaining_barca > 0:
+                if remaining_real >= remaining_barca:
+                    if remaining_real > 0:
                         assigned_club = "real"
-                    else:
+                    elif remaining_barca > 0:
                         assigned_club = "barca"
-                elif real_count < target_per_club:
-                    assigned_club = "real"
                 else:
-                    assigned_club = "barca"
+                    if remaining_barca > 0:
+                        assigned_club = "barca"
+                    elif remaining_real > 0:
+                        assigned_club = "real"
 
         if assigned_club:
             key = candidate["key"]
@@ -622,33 +678,10 @@ def select_diverse_news(news_results):
             else:
                 barca_count += 1
 
-        if real_count >= target_per_club and barca_count >= target_per_club:
+        if real_count >= target_real and barca_count >= target_barca:
             break
 
-    balanced_target = min(real_count, barca_count)
-    if balanced_target == 0:
-        return []
-
-    balanced_selected: list[dict] = []
-    real_count = 0
-    barca_count = 0
-    for candidate in selected:
-        club = candidate["item"].get("club")
-        if club == "real":
-            if real_count >= balanced_target:
-                continue
-            real_count += 1
-        elif club == "barca":
-            if barca_count >= balanced_target:
-                continue
-            barca_count += 1
-        else:
-            continue
-        balanced_selected.append(candidate)
-        if real_count >= balanced_target and barca_count >= balanced_target:
-            break
-
-    return [candidate["item"] for candidate in balanced_selected]
+    return [candidate["item"] for candidate in selected]
 
 
 # === Generación de contenido ===
@@ -666,6 +699,9 @@ def generate_expert_post(
     else:
         noticia = title or content
 
+    summary_max_chars = _get_summary_max_chars()
+    question_max_chars = _get_question_max_chars()
+
     # MODIFICACIÓN: Prompt diseñado para preguntas incisivas y concretas.
     base_prompt = f"""
 NOTICIA: {noticia}
@@ -675,14 +711,14 @@ HANDLE_SUGERIDO: {suggested_handle}
 TAREA: Devuelve una respuesta dividida en 2 partes usando EXACTAMENTE el separador ###.
 
 PARTE 1 (RESUMEN):
-- Resumen de la noticia, máximo 170 caracteres.
+- Resumen de la noticia, máximo {summary_max_chars} caracteres.
 - Texto limpio, sin etiquetas tipo "Resumen:".
 
 ###
 
 PARTE 2 (PREGUNTA + FUENTE + HASHTAGS):
-- Genera una PREGUNTA CORTA (máximo 85 caracteres), 1 línea.
-- Tono: directo pero fácil de entender, sin humor forzado pero con sarcasmo.
+- Genera una PREGUNTA CORTA (máximo {question_max_chars} caracteres), 1 línea.
+- Tono: c´ritico pero fácil de entender, sin humor forzado pero con sarcasmo.
 - Debe ser concreta y polémica: debe joder al aficcionado que lo lea.
 - Incluye al menos 1 elemento literal de NOTICIA (nombre propio, club o competición).
 - NO preguntes datos obvios (ej: "¿Quién ganó?"). Cuestiona el "cómo" o el "por qué".
@@ -690,7 +726,7 @@ PARTE 2 (PREGUNTA + FUENTE + HASHTAGS):
 - NO empieces con "¿Por qué", "¿De verdad", "¿Tan", "¿Hasta cuándo".
 - NO repitas el resumen.
 - 1 línea con la fuente: "Fuente: {suggested_handle}".
-- 1 línea final con 1 hashtag que sea el más posible trending topic relacionado con el tema.
+- 1 línea final con 1 hashtag que sea el más posible trending topic relacionado con el tema. Si se menciona a alguien importante, usa su hashtag oficial. Si no, usa #RealMadrid o #FCBarcelona según corresponda.
 
 REGLAS GENERALES:
 1. IDIOMA: Español de España (coloquial futbolero).

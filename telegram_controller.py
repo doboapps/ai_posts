@@ -1,3 +1,4 @@
+import os
 import re
 import threading
 import time
@@ -12,6 +13,9 @@ from telebot import types
 from macro_engine import build_macro_drafts
 
 load_dotenv()
+
+DEFAULT_X_INTENT_MAX_CHARS = 280
+DEFAULT_URL_WEIGHT = 23
 
 
 def _get_chat_id(raw_chat_id: Optional[str]) -> Optional[Union[int, str]]:
@@ -34,6 +38,15 @@ def _normalize_intent_text(text: str) -> str:
     return normalized.replace("%", "%25")
 
 
+def _get_x_intent_max_chars() -> int:
+    raw = (os.getenv("X_INTENT_MAX_CHARS") or "").strip()
+    if raw.isdigit():
+        value = int(raw)
+        if value > 0:
+            return value
+    return DEFAULT_X_INTENT_MAX_CHARS
+
+
 def _extract_intent_hashtags(text: str, max_count: int = 2) -> tuple[str, list[str]]:
     tags = re.findall(r"#([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+)", text or "")
     unique: list[str] = []
@@ -53,6 +66,51 @@ def _extract_intent_hashtags(text: str, max_count: int = 2) -> tuple[str, list[s
     cleaned = re.sub(r"#([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+)", "", text or "")
     cleaned = " ".join(cleaned.split()).strip()
     return cleaned, unique
+
+
+def _estimate_hashtag_length(tags: list[str]) -> int:
+    if not tags:
+        return 0
+    return sum(len(tag) + 1 for tag in tags) + (len(tags) - 1)
+
+
+def _intent_tail_length(url: str, tags: list[str]) -> int:
+    length = 0
+    if url:
+        length += DEFAULT_URL_WEIGHT
+    if tags:
+        if url:
+            length += 1
+        length += _estimate_hashtag_length(tags)
+    return length
+
+
+def _trim_text_to_limit(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip()
+
+
+def _fit_intent_text(
+    text: str, url: str, tags: list[str], max_chars: int
+) -> tuple[str, list[str]]:
+    intent_text = _normalize_intent_text(text)
+    safe_tags = list(tags)
+    tail_len = _intent_tail_length(url, safe_tags)
+    if tail_len > max_chars and safe_tags:
+        safe_tags = []
+        tail_len = _intent_tail_length(url, safe_tags)
+
+    allowed_text_len = max_chars - tail_len
+    if tail_len > 0:
+        allowed_text_len -= 1
+    if allowed_text_len <= 0:
+        return "", safe_tags
+    if len(intent_text) > allowed_text_len:
+        intent_text = _trim_text_to_limit(intent_text, allowed_text_len)
+    return intent_text, safe_tags
 
 
 def _append_source_link(text: str, url: str) -> str:
@@ -166,7 +224,12 @@ def send_drafts(drafts, chat_id):
         full_x_text = caption_text
         intent_source_text = combined_text or ai_text
         intent_base_text, intent_tags = _extract_intent_hashtags(intent_source_text, max_count=2)
-        intent_text = _normalize_intent_text(intent_base_text)
+        intent_text, intent_tags = _fit_intent_text(
+            intent_base_text,
+            source_url,
+            intent_tags,
+            _get_x_intent_max_chars(),
+        )
         intent_url = (
             "https://twitter.com/intent/tweet?text="
             f"{quote(intent_text, safe='', encoding='utf-8')}"

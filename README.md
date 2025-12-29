@@ -34,6 +34,9 @@ ALLOW_STALE_NEWS=0
 ONLY_TODAY=1
 RSS_TIMEOUT_SECS=20
 RSS_MAX_ITEMS_PER_FEED=25
+SUMMARY_MAX_CHARS=140
+TWEET_MAX_CHARS=80
+X_INTENT_MAX_CHARS=280
 ```
 
 ## Fuentes RSS
@@ -60,7 +63,9 @@ Si te basta con ejecutar el bot 1 vez por hora entre las 08:00 y 21:00, puedes u
      - `RUN_TZ` (ej: `Europe/Madrid`)
      - `RUN_START_HOUR` (default `8`)
      - `RUN_END_HOUR` (default `21`)
-     - `MAX_DRAFTS` (ej: `6`)
+     - `MAX_DRAFTS` (ej: `12`)
+     - `REAL_DRAFTS` (opcional; si se define junto a `BARCA_DRAFTS` fija el reparto)
+     - `BARCA_DRAFTS` (opcional; si solo defines uno, el otro se completa hasta `MAX_DRAFTS`)
      - `SEND_EMPTY_MESSAGE` (`1` para avisar cuando no haya borradores)
      - `MAX_NEWS_AGE_DAYS` (default `3`)
      - `ALLOW_UNDATED_NEWS` (`1` para permitir resultados sin fecha, default `1`)
