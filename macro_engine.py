@@ -5,6 +5,7 @@ import re
 import time
 from datetime import datetime
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import feedparser
 import requests
@@ -42,6 +43,7 @@ _NON_FOOTBALL_HINTS = [
     "liga-endesa",
     "endesa",
     'femenino',
+    'futures',
 ]
 
 _BLOCKED_URL_CONTAINS = [
@@ -101,11 +103,13 @@ _BAD_QUESTION_STARTS = (
 
 _RSS_SOURCES = [
     {"name": "Marca", "url": "https://objetos.estaticos-marca.com/rss/futbol/real-madrid.xml"},
-    {"name": "Sport", "url": "https://www.sport.es/es/rss/barca/rss.xml"},
+    {"name": "Marca", "url": "https://e00-xlk-ue-marca.uecdn.es/rss/googlenews/portada.xml"},
     {"name": "AS", "url": "https://feeds.as.com/mrss-s/list/as/site/as.com/tag/real_madrid_a/"},
+    {"name": "AS", "url": "https://feeds.as.com/mrss-s/pages/as/site/as.com/section/futbol/portada/"},
+    {"name": "Sport", "url": "https://www.sport.es/es/rss/barca/rss.xml"},
     {"name": "Mundo Deportivo", "url": "https://www.mundodeportivo.com/feed/rss/futbol"},
-    {"name": "El Periodico", "url": "https://www.elperiodico.com/es/rss/barca/rss.xml"},
     {"name": "El Pais", "url": "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/deportes/portada"},
+    {"name": "El Periodico", "url": "https://www.elperiodico.com/es/rss/barca/rss.xml"},
 ]
 
 # === Búsqueda y filtrado de noticias ===
@@ -142,6 +146,7 @@ _BARCA_TOKENS = [
 
 _PRIORITY_SOURCES = [
     "marca.com",
+    "uecdn.es",
     "sport.es",
     "as.com",
     "elperiodico.com",
@@ -154,6 +159,20 @@ _AGGREGATOR_DOMAINS = [
     "feedproxy.google.com",
     "feedburner.com",
 ]
+_TRACKING_QUERY_PARAMS = {
+    "fbclid",
+    "gclid",
+    "dclid",
+    "igshid",
+    "mc_cid",
+    "mc_eid",
+    "mkt_tok",
+    "_hsenc",
+    "_hsmi",
+    "guccounter",
+    "guce_referrer",
+    "guce_referrer_sig",
+}
 
 
 def _extract_domain(url: str) -> str:
@@ -167,6 +186,30 @@ def _domain_matches(domain: str, priority: str) -> bool:
     if not domain or not priority:
         return False
     return domain == priority or domain.endswith(f".{priority}")
+
+
+def _normalize_url_for_dedupe(url: str) -> str:
+    cleaned = (url or "").strip()
+    if not cleaned:
+        return ""
+    parts = urlsplit(cleaned)
+    if not parts.netloc:
+        return cleaned.lower()
+    scheme = parts.scheme.lower() or "https"
+    netloc = parts.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = parts.path or ""
+    if path != "/":
+        path = path.rstrip("/")
+    query_params = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        lower_key = key.lower()
+        if lower_key.startswith("utm_") or lower_key in _TRACKING_QUERY_PARAMS:
+            continue
+        query_params.append((key, value))
+    query = urlencode(query_params, doseq=True)
+    return urlunsplit((scheme, netloc, path, query, ""))
 
 
 def _pick_entry_url(entry: dict) -> str:
@@ -367,7 +410,7 @@ def _merge_results(primary: list[dict], secondary: list[dict]) -> list[dict]:
     merged: list[dict] = []
     seen: set[str] = set()
     for item in primary + secondary:
-        url = (item.get("url") or "").strip().lower()
+        url = _normalize_url_for_dedupe(item.get("url") or "")
         key = url or (item.get("title") or "").strip().lower()
         if key:
             if key in seen:
@@ -611,7 +654,7 @@ def select_diverse_news(news_results):
             if not allow_stale:
                 continue
 
-        key = (url or title).strip().lower()
+        key = _normalize_url_for_dedupe(url) or title.lower()
         candidates.append(
             {
                 "item": item,
@@ -717,9 +760,10 @@ PARTE 1 (RESUMEN):
 ###
 
 PARTE 2 (PREGUNTA + FUENTE + HASHTAGS):
+- Analiza la situación actual del equipo.
+Si la noticia implica mal juego, derrota o decisiones cuestionables, identifica el PUNTO DE DOLOR del aficionado. ¿Qué es lo que más le molestaría a un socio del club hoy mismo sobre este tema?
 - Genera una PREGUNTA CORTA (máximo {question_max_chars} caracteres), 1 línea.
-- Tono: c´ritico pero fácil de entender, sin humor forzado pero con sarcasmo.
-- Debe ser concreta y polémica: debe joder al aficcionado que lo lea.
+- Tono: crítico pero fácil de entender, sin humor forzado pero con sarcasmo.
 - Incluye al menos 1 elemento literal de NOTICIA (nombre propio, club o competición).
 - NO preguntes datos obvios (ej: "¿Quién ganó?"). Cuestiona el "cómo" o el "por qué".
 - EVITA muletillas genéricas como: "¿Hasta cuándo?", "¿Tan difícil?", "¿De verdad?".
